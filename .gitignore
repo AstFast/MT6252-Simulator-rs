@@ -1,0 +1,13 @@
+/target
+Rom/fat32.img
+/Rom
+/dump
+# SD 镜像与它的基线副本各 512 MiB，而且 `fat32.base.img` 是"某一轮跑完之后的卡"，
+# 不是可复现的输入 —— 两者都由 `/Rom` 排除，这里点名只是为了说明理由。
+Rom/fat32.base.img
+# 专有二进制：别人的工具链产物，不是本仓库的工作成果
+/work
+/tools
+/.cargo
+__pycache__/
+*.pyc

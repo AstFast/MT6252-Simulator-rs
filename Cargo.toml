@@ -1,0 +1,17 @@
+[package]
+name = "mt6252-sim"
+version = "0.1.0"
+edition = "2021"
+description = "MT6252 (MTK2G baseband) 固件模拟器，Rust 重写版"
+# 静态链接 GPL-2.0 的 Unicorn，整体按 GPL-2.0 传
+license = "GPL-2.0-only"
+
+[dependencies]
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm"] }
+winit = "0.30"
+softbuffer = "0.4"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
+
+[profile.release]
+lto = "thin"

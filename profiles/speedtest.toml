@@ -1,0 +1,228 @@
+# IHD 316 / MT6252 固件画像
+#
+# 数据来源：C 版 `MT6252_Simulator/src/main.c` 的 hookCodeCallBack、RunArmProgram、
+# keypaddef[]，以及 docs/hook备份.c 里那批 L1 层补丁点。
+# 每一条都记了它是干什么的——换固件时照着这份注释逐条重新定位即可。
+
+name = "IHD 316 (F006-1_P14v01.02b01)"
+
+[rom]
+file = "08000000.bin"
+base = 0x0800_0000
+size = 0x0100_0000
+crc32 = 0xB8D1_7490
+
+[interrupt]
+# 芯片语义是跳 ARM 的 IRQ 向量 0x18，向量代码由固件开机时复制到 0x0..0x140。
+# 但这份固件实测：跳 0x18 后 ISR 不返回哨兵（切不切 IRQ 模式都一样），
+# 固件随即落到自己的致命处理 0x81B935A。所以这里覆盖成分发入口，
+# 即 C 版 `#define IRQ_HANDLER 0x4000A290` 的做法。
+# 想继续挖真向量这条路，把 handler 这行注释掉即可（MT6252_MODESWITCH=1 配合看）。
+vector = 0x18
+handler = 0x4000_A290
+# 内核"当前任务"指针的存放处（两级间接：这里放着一个指针，指针指向的字才是当前 TCB）。
+# 地址是从分发器自己取的：`0x4000A198: ldr r0,[pc,#-0x744]` → `0x4000A1A0-0x744 = 0x40009A5C`，
+# 再 `ldr r5,[r0]` 才是 TCB。填上它就启用"调度器没起来就不投中断"的门控，理由见
+# `Vm::task_running`：boot 线程没有 TCB，被 ISR 的任务切换一走就再也回不来了。
+current_task = 0x4000_9A5C
+# 固件开机时（0x08001B00）从 ROM 0x0850FA7C 反转出来的 64 字节 logical→physical 表。
+# LISR 表、INT_STATUS、掩码位、EOI 位全都按**物理**号索引，注入前必须换算：
+# 实测 0→0, 1→2, 2→3, 3→4, 4→5, 5→6, 6→1（L1SM 往回映射）, 7 以上恒等。
+line_map = 0xF016_C468
+
+# tick 的投法。实测（同一份代码、只改这几行）：
+#   投 CTIRQ1（1 号线，硬件语义的比较匹配）→ 初始化链被打断，固件早早进内核睡眠
+#   投 2 号线（C 版 `StartInterrupt(2)` 的写法）→ 2 号线固件从不使能，等于不投
+#   不投 tick、只投 RTC/键盘 → 同样早早睡眠
+#   完全不投中断（`MT6252_NO_IRQ=1`）→ 跑得最深：SD mount ok → FAT 读块 → PMIC →
+#     l1audio_sethandler，并且开始使能 2/3 号线（L1D_CTIRQ2 / L1D_DSP2CPU）
+# 所以这一阶段的卡点不在"缺 tick"：CTIRQ1 的 LISR 服务函数（`0x08018638`）第一句就被
+# `0xF016C918+0x18` 这个全 0 的控制块挡回来，投进去不产生任何效果，只负责把初始化打断。
+# 默认先关掉 tick。注意"任何中断注入都会打断初始化"这件事本身就是个没查清的症状
+# （C 版也投 RTC，却没这个现象），是排在 L1 设备前面的第二个问题。
+[timer]
+# tick 的四档实测（2026-09-23，都是 16 秒，比 [fw] 轨迹内容、不比计数）：
+#   ctirq1=true/line=1        → 轨迹 12 条，irq ok=7
+#   ctirq1=false/line=1       → 逐条相同
+#   ctirq1=false/line=2 + periodic_ms=5（照 C 版 config.h 的 interruptPeroidms=5）
+#                             → 逐条相同，但 tick 真投进 310 次
+#   ctirq1=false/line=10 + periodic_ms=5（GPT：固件确实使能着 10 号线，也在轮询 0x8106_xxxx）
+#                             → 投进 117 次，轨迹仍然逐条相同
+# 所以"缺系统 tick"这个方向已经排除过两次，别再试。留硬件忠实的那一档。
+ctirq1 = true
+line = 1
+# 比较匹配模型已经能把时刻换算对了（见 devices/c1xx.rs 的 arm），不需要盲投兜底。
+# periodic_ms = 5
+
+# CPU 睡眠判据：固件的睡眠流程在 0x08000cdc 把"醒来后恢复用的 CPSR"写成 0xC0
+# ⚠ 实测这条判据是个**从来没能生效的死钩子**，别当凭据：停车时该字读回来是 0
+# （见 dump/4000b240_40.bin），而且邻居 `[0x4000_B260]` 读到 0xF016D2F4、不是当年以为的
+# "RISI" 魔数。按"PC 落在停车区间 `0x4000_8338..0x4000_835C`（最深睡眠档的无出口循环
+# `bl 0x4000_822c` + `b .-8`，整份 ROM 没有一条 WFI）就算睡着"做过一轮 A/B，
+# 深度计数一点没动（`时钟递增=975`、`irq ok=980` 两边完全一样），已回退 ——
+# 因为方向错了：tick 冻住是致命关机**之后**的结果，上游是 0x8001_0118 那个自相矛盾的读值。
+[sleep]
+resume_state = 0x4000_B25C
+# 睡着时 PC 实测落在这两段（分开写，因为中间夹着 0x4000_A290 = 我们的 ISR 分发入口，
+# 并成一段就等于允许在 ISR 中途再放一条中断）：
+#   1) L1D 每拍链 + 最深档停车循环（`0x4000_834c: bl 0x4000_822c` + `b .-8`，无出口）
+#      实测采样 PC：0x4000_81FC、0x4000_8243、0x4000_8264
+#   2) 它调用的开关中断原语（终态实测 PC = 0x4000_a34c，ROM 镜像 0x0870_5F48）
+park = [
+  { lo = 0x4000_81F0, hi = 0x4000_835c },
+  { lo = 0x4000_A31C, hi = 0x4000_A35c },
+]
+
+[lcd]
+width = 240
+height = 320
+
+[boot]
+power_key = 0x17
+
+[[boot.poke]]
+addr = 0xA100_01D4
+value = 0x0
+note = "C 版本意是写 0x1234，但 uc_mem_write 传错了变量，实际写进去的是 0；固件按 0 跑通，别'顺手修正'"
+
+[[boot.poke]]
+addr = 0xF018_CFE5
+value = 0x20
+size = 1
+note = "过寄存器检测"
+
+[[boot.poke]]
+addr = 0x8106_0010
+value = 2
+note = "GPT1 状态位。实测 bit0 走不通：GPT 的 LISR(0x0800DAE4) 要 blx [r5+0x2C]，而 [r5]=[0xF0322760] 一直是 0（回调对象从没注册），所以 GPT 不是系统时钟源，别再把 bit0 置起来"
+
+[[boot.poke]]
+addr = 0x8200_021C
+value = 2
+note = "过 sub_80017C0"
+
+[[boot.poke]]
+addr = 0x8200_0224
+value = 0xFFF0_0000
+note = "C 版写法：0x3FFFFFF << 16"
+
+[[boot.poke]]
+addr = 0x8200_0228
+value = 660
+
+[[boot.poke]]
+addr = 0x8100_0040
+value = 3
+note = "跳过最开始的地址映射阶段"
+
+[[boot.poke]]
+addr = 0x8103_0014
+value = 0x20
+note = "UART 线状态，过 sub_819E8EC"
+
+[[boot.poke]]
+addr = 0x8001_0008
+value = 0x6250
+note = "过 sub_8000D9C"
+
+[[boot.poke]]
+addr = 0x0800_0AD4
+value = 2
+size = 2
+note = "过 sub_8703796"
+
+[[boot.poke]]
+addr = 0xF016_AD20
+value = 0x2640_9001
+note = "打开 memory dump 相关调试位"
+
+# 未实现设备时的读回值。注意 0x8200_0230（13MHz 计数器）不在这里——那是芯片真行为，
+# 由代码按宿主时钟给出。
+[[read_override]]
+addr = 0x810C_0090
+value = 0x10
+note = "过 sub_8122d8c 的 while"
+
+[[read_override]]
+addr = 0xA100_03F6
+value = 0x8888
+note = "半字地址：C 版是拿这个地址原样写 4 字节，所以 0x8888 落在 F6..F7，固件 `ldrh [0xA10003F6]` 才比得上；覆盖值会按 addr&3 摆进对应 lane（见 `Vm::new`）"
+
+[[read_override]]
+addr = 0xA000_0000
+value = 0x5555
+note = "L1 音频握手字，过 sub_8094040"
+
+[[read_override]]
+addr = 0x8301_0A28
+value = 0
+note = "Flash 忙标志：0 = 不忙"
+
+[[read_override]]
+addr = 0x8205_0000
+value = 0
+note = "固件写 1 之后要立刻读回 0 的握手位"
+
+# ---------- 补丁表 ----------
+
+# CPU 异常处理入口（`0x0800_2B64` 是真函数首：`push {r0,r1,r4,r5,r6,r7,lr}`）。
+# 晚期快照里 `[0xF016AD1C] = 2` 正好等于它的致命阈值（`0x0800_2B82: cmp r0,2 / blo` 走不下去
+# → `0x0800_2B86` 打 "Caution: Possibly Endless Nested Exceptions!" → `bl 0x081A_0698` →
+# `0x081B_9338` → PWDKEY 关机），所以终点不是"没事干"而是**异常真的发生了两次**。
+# lr 直接给出是谁跳进来的（向量代码在 0x0..0x140，由固件开机复制）。
+[sim_stub]
+# ---------- 虚拟 SIM 卡：补"没人按下发送键"这一步 ----------
+# 实测到位的墙：SIM/SIM_2 都卡在**第一次**阻塞收信（timeout = −1，永不自愈），而投递机制本身是
+# 好的（一次开机 80 次投递，dst_id 分布里没有 SIM 的 0x12 / SIM_2 的 0x13）。该发消息的那个
+# 按 local id 派发的服务模块（`0x0804_92xx` 一族）从头到尾没被调用过。
+# 做法是"调固件自己的函数"，不伪造队列内容、不伪造寄存器、不跳进函数中段。
+# 方案 1（`0x081E_18A8` 消息构造器）已经试过并证明到顶：机制通（`QUEUE_Send` 80→81、
+# 出现 `投递dst_id(0x12)`、`SIM第一次阻塞收信` 2→3，任务确实被叫醒），但醒后落到
+# `0x0800CB18: bl 0x0801_4668`，那个分发器还要 `msg[+6]==1`、`msg[+0x151]==1`、
+# `msg[+0x2C5]==0` 加一次长度校验 —— 构造器入参凑不出这张上下文。
+# 顺带纠正一条我之前的错判：`SIM main` 里 `cmp r0,0x6A / beq 0x0800CB08` **不是**复位判据，
+# 不相等的分支只是先调一次 `0x0823FCA8`，之后**落到同一个 0x0800CB08**。别再拿 0x6A 当依据。
+enable = false
+# 注入窗口是量出来的（基线 `dump/run_attr.log`）：L1AUDIO 的 5 个注册在**片 ≤2360** 已完成，
+# 固件 park 发生在片 4000 之前，而 park 之后 `ctx_stack` 永远非空（固件是在 ISR 上下文里
+# 走进"无任务"死循环的）⇒ 只能投在 2400~park 之间。不安静时代码会自动逐片顺延。
+after_slices = 2500
+# 方案 2：直接调 SIM 接口派发器。它自己会 `[[0xF0161E0C]+slot*4] → entry[0] = 0x0803_56F9`。
+# 入参约定（逐条 r2 核实过 `0x080D_0EC0` 体内）：
+#   r3 = 槽号键，由 `bl 0x081A_2A24` 按 `0x0851_C584` 的两项配置解析成槽 0/1；≥4 会 assert 0x10F
+#   r1 必须非 0（`0x080D_0EEA: ldr r0,[sp,#8]` 在 `push{r0-r7,lr}; sub sp,4` 之后取的就是保存的 r1）
+#   r0/r1/r2 会原样转交给冷复位 handler（`0x080D_0F22: add r0,sp,4 ; ldm r0,{r0,r1,r2}`）
+func = 0x080D_0EC0
+arg0 = 0x00
+arg1 = 0x01
+arg2 = 0x00
+arg3 = 0x00
+# 走"消息构造器"那条路时才用得上这两个（现在不用，见上面的 msg[+0x151] 那串上下文）
+msg_id_slot = 0x0000_0000
+msg_id = 0x00
+# 实测上一版就是卡在这道守卫上：片数到 4435 也没注入 —— 固件到点已 park 在关机 `b .`，
+# 之前 MSDC 完成回调占住的 callback_ctx 永远不会返回，"等安静"= 永不注入。
+require_quiet = false
+
+[l1]
+# L1D 驱动的请求挂起位图（固件自己的 RAM 变量，不是寄存器）。CPU 侧只有置位的
+# `orr`（flash 0x081CEECE），整份 ROM 没有清位代码 —— 真机由 L1 当总线主设备清。
+pending_mask = 0x4000_C828
+
+[keypad]
+# key_pad_comm_def->keypad[72]，0xFE 表示该位置没有按键
+matrix = [
+    0x12, 0x49, 0x0F, 0x1A, 0x15, 0xFE, 0xFE, 0xFE,
+    0x17, 0x10, 0x03, 0x02, 0x01, 0x11, 0xFE, 0xFE,
+    0xFE, 0x17, 0x1B, 0x06, 0x05, 0x04, 0x0E, 0xFE,
+    0xFE, 0xFE, 0x17, 0x7B, 0x09, 0x08, 0x07, 0x14,
+    0xFE, 0xFE, 0xFE, 0x17, 0x7C, 0x0B, 0x00, 0x0A,
+    0x16, 0xFE, 0xFE, 0xFE, 0x17, 0xFE, 0xFE, 0xFE,
+    0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x17, 0xFE, 0xFE,
+    0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x17, 0xFE,
+    0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x17,
+]
+
+# ---------- C 参考日志自报的调用点路线（它自己把地址打在括号里）----------
+# 逐个挂计数：按 C 的顺序看，第一个为 0 的点就是我们与 C 参考实现的分叉处。
+# 这批点都是至多执行一次的日志点，计数开销可忽略。

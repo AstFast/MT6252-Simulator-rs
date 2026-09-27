@@ -1,0 +1,3005 @@
+# IHD 316 / MT6252 固件画像
+#
+# 数据来源：C 版 `MT6252_Simulator/src/main.c` 的 hookCodeCallBack、RunArmProgram、
+# keypaddef[]，以及 docs/hook备份.c 里那批 L1 层补丁点。
+# 每一条都记了它是干什么的——换固件时照着这份注释逐条重新定位即可。
+
+name = "IHD 316 (F006-1_P14v01.02b01)"
+
+[rom]
+file = "08000000.bin"
+base = 0x0800_0000
+size = 0x0100_0000
+crc32 = 0xB8D1_7490
+
+[interrupt]
+# 芯片语义是跳 ARM 的 IRQ 向量 0x18，向量代码由固件开机时复制到 0x0..0x140。
+# 但这份固件实测：跳 0x18 后 ISR 不返回哨兵（切不切 IRQ 模式都一样），
+# 固件随即落到自己的致命处理 0x81B935A。所以这里覆盖成分发入口，
+# 即 C 版 `#define IRQ_HANDLER 0x4000A290` 的做法。
+# 想继续挖真向量这条路，把 handler 这行注释掉即可（MT6252_MODESWITCH=1 配合看）。
+vector = 0x18
+handler = 0x4000_A290
+# 内核"当前任务"指针的存放处（两级间接：这里放着一个指针，指针指向的字才是当前 TCB）。
+# 地址是从分发器自己取的：`0x4000A198: ldr r0,[pc,#-0x744]` → `0x4000A1A0-0x744 = 0x40009A5C`，
+# 再 `ldr r5,[r0]` 才是 TCB。填上它就启用"调度器没起来就不投中断"的门控，理由见
+# `Vm::task_running`：boot 线程没有 TCB，被 ISR 的任务切换一走就再也回不来了。
+current_task = 0x4000_9A5C
+# 固件开机时（0x08001B00）从 ROM 0x0850FA7C 反转出来的 64 字节 logical→physical 表。
+# LISR 表、INT_STATUS、掩码位、EOI 位全都按**物理**号索引，注入前必须换算：
+# 实测 0→0, 1→2, 2→3, 3→4, 4→5, 5→6, 6→1（L1SM 往回映射）, 7 以上恒等。
+line_map = 0xF016_C468
+
+# tick 的投法。实测（同一份代码、只改这几行）：
+#   投 CTIRQ1（1 号线，硬件语义的比较匹配）→ 初始化链被打断，固件早早进内核睡眠
+#   投 2 号线（C 版 `StartInterrupt(2)` 的写法）→ 2 号线固件从不使能，等于不投
+#   不投 tick、只投 RTC/键盘 → 同样早早睡眠
+#   完全不投中断（`MT6252_NO_IRQ=1`）→ 跑得最深：SD mount ok → FAT 读块 → PMIC →
+#     l1audio_sethandler，并且开始使能 2/3 号线（L1D_CTIRQ2 / L1D_DSP2CPU）
+# 所以这一阶段的卡点不在"缺 tick"：CTIRQ1 的 LISR 服务函数（`0x08018638`）第一句就被
+# `0xF016C918+0x18` 这个全 0 的控制块挡回来，投进去不产生任何效果，只负责把初始化打断。
+# 默认先关掉 tick。注意"任何中断注入都会打断初始化"这件事本身就是个没查清的症状
+# （C 版也投 RTC，却没这个现象），是排在 L1 设备前面的第二个问题。
+[timer]
+# tick 的四档实测（2026-09-23，都是 16 秒，比 [fw] 轨迹内容、不比计数）：
+#   ctirq1=true/line=1        → 轨迹 12 条，irq ok=7
+#   ctirq1=false/line=1       → 逐条相同
+#   ctirq1=false/line=2 + periodic_ms=5（照 C 版 config.h 的 interruptPeroidms=5）
+#                             → 逐条相同，但 tick 真投进 310 次
+#   ctirq1=false/line=10 + periodic_ms=5（GPT：固件确实使能着 10 号线，也在轮询 0x8106_xxxx）
+#                             → 投进 117 次，轨迹仍然逐条相同
+# 所以"缺系统 tick"这个方向已经排除过两次，别再试。留硬件忠实的那一档。
+ctirq1 = true
+line = 1
+# 比较匹配模型已经能把时刻换算对了（见 devices/c1xx.rs 的 arm），不需要盲投兜底。
+# periodic_ms = 5
+
+# CPU 睡眠判据：固件的睡眠流程在 0x08000cdc 把"醒来后恢复用的 CPSR"写成 0xC0
+# ⚠ 实测这条判据是个**从来没能生效的死钩子**，别当凭据：停车时该字读回来是 0
+# （见 dump/4000b240_40.bin），而且邻居 `[0x4000_B260]` 读到 0xF016D2F4、不是当年以为的
+# "RISI" 魔数。按"PC 落在停车区间 `0x4000_8338..0x4000_835C`（最深睡眠档的无出口循环
+# `bl 0x4000_822c` + `b .-8`，整份 ROM 没有一条 WFI）就算睡着"做过一轮 A/B，
+# 深度计数一点没动（`时钟递增=975`、`irq ok=980` 两边完全一样），已回退 ——
+# 因为方向错了：tick 冻住是致命关机**之后**的结果，上游是 0x8001_0118 那个自相矛盾的读值。
+[sleep]
+resume_state = 0x4000_B25C
+# 睡着时 PC 实测落在这两段（分开写，因为中间夹着 0x4000_A290 = 我们的 ISR 分发入口，
+# 并成一段就等于允许在 ISR 中途再放一条中断）：
+#   1) L1D 每拍链 + 最深档停车循环（`0x4000_834c: bl 0x4000_822c` + `b .-8`，无出口）
+#      实测采样 PC：0x4000_81FC、0x4000_8243、0x4000_8264
+#   2) 它调用的开关中断原语（终态实测 PC = 0x4000_a34c，ROM 镜像 0x0870_5F48）
+park = [
+  { lo = 0x4000_81F0, hi = 0x4000_835c },
+  { lo = 0x4000_A31C, hi = 0x4000_A35c },
+]
+
+[lcd]
+width = 240
+height = 320
+
+[boot]
+power_key = 0x17
+
+[[boot.poke]]
+addr = 0xA100_01D4
+value = 0x0
+note = "C 版本意是写 0x1234，但 uc_mem_write 传错了变量，实际写进去的是 0；固件按 0 跑通，别'顺手修正'"
+
+[[boot.poke]]
+addr = 0xF018_CFE5
+value = 0x20
+size = 1
+note = "过寄存器检测"
+
+[[boot.poke]]
+addr = 0x8106_0010
+value = 2
+note = "GPT1 状态位。实测 bit0 走不通：GPT 的 LISR(0x0800DAE4) 要 blx [r5+0x2C]，而 [r5]=[0xF0322760] 一直是 0（回调对象从没注册），所以 GPT 不是系统时钟源，别再把 bit0 置起来"
+
+[[boot.poke]]
+addr = 0x8200_021C
+value = 2
+note = "过 sub_80017C0"
+
+[[boot.poke]]
+addr = 0x8200_0224
+value = 0xFFF0_0000
+note = "C 版写法：0x3FFFFFF << 16"
+
+[[boot.poke]]
+addr = 0x8200_0228
+value = 660
+
+[[boot.poke]]
+addr = 0x8100_0040
+value = 3
+note = "跳过最开始的地址映射阶段"
+
+[[boot.poke]]
+addr = 0x8103_0014
+value = 0x20
+note = "UART 线状态，过 sub_819E8EC"
+
+[[boot.poke]]
+addr = 0x8001_0008
+value = 0x6250
+note = "过 sub_8000D9C"
+
+[[boot.poke]]
+addr = 0x0800_0AD4
+value = 2
+size = 2
+note = "过 sub_8703796"
+
+[[boot.poke]]
+addr = 0xF016_AD20
+value = 0x2640_9001
+note = "打开 memory dump 相关调试位"
+
+# 未实现设备时的读回值。注意 0x8200_0230（13MHz 计数器）不在这里——那是芯片真行为，
+# 由代码按宿主时钟给出。
+[[read_override]]
+addr = 0x810C_0090
+value = 0x10
+note = "过 sub_8122d8c 的 while"
+
+[[read_override]]
+addr = 0xA100_03F6
+value = 0x8888
+note = "半字地址：C 版是拿这个地址原样写 4 字节，所以 0x8888 落在 F6..F7，固件 `ldrh [0xA10003F6]` 才比得上；覆盖值会按 addr&3 摆进对应 lane（见 `Vm::new`）"
+
+[[read_override]]
+addr = 0xA000_0000
+value = 0x5555
+note = "L1 音频握手字，过 sub_8094040"
+
+[[read_override]]
+addr = 0x8301_0A28
+value = 0
+note = "Flash 忙标志：0 = 不忙"
+
+[[read_override]]
+addr = 0x8205_0000
+value = 0
+note = "固件写 1 之后要立刻读回 0 的握手位"
+
+# ---------- 补丁表 ----------
+
+# CPU 异常处理入口（`0x0800_2B64` 是真函数首：`push {r0,r1,r4,r5,r6,r7,lr}`）。
+# 晚期快照里 `[0xF016AD1C] = 2` 正好等于它的致命阈值（`0x0800_2B82: cmp r0,2 / blo` 走不下去
+# → `0x0800_2B86` 打 "Caution: Possibly Endless Nested Exceptions!" → `bl 0x081A_0698` →
+# `0x081B_9338` → PWDKEY 关机），所以终点不是"没事干"而是**异常真的发生了两次**。
+# lr 直接给出是谁跳进来的（向量代码在 0x0..0x140，由固件开机复制）。
+[[patch]]
+addr = 0x0800_2B64
+action = { kind = "count", label = "CPU异常处理入口" }
+
+[[patch]]
+addr = 0x0800_2B64
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "异常入口r0lr" }
+
+[[patch]]
+addr = 0x0800_2B86
+action = { kind = "count", label = "嵌套异常_到致命阈值" }
+
+[[patch]]
+addr = 0x081A_0698
+action = { kind = "count", label = "致命退出桩" }
+
+# 实测否掉"嵌套 CPU 异常"这条读法：`CPU异常处理入口` 与 `嵌套异常_到致命阈值` 全程为 0，
+# 而 `致命退出桩 = 1` —— 所以进的是**另一份同构代码** `0x0800_7ED0`（它同样自增
+# `[0xF016AD1C]` 并 `cmp 2`），并且 0x081A_061C 会先看 `[0xF01E9275]`/`[0x0851_0748]`
+# 再决定打不打印，所以日志里一个字都没有。下面这三条直接把"它到底想打印什么"读出来。
+[[patch]]
+addr = 0x081A_061C
+action = { kind = "log_str", reg = "r0", label = "致命消息" }
+
+[[patch]]
+addr = 0x0800_7EE4
+action = { kind = "count", label = "嵌套异常计数_第二份代码" }
+
+[[patch]]
+addr = 0x081A_AF3E
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "致命前调AF3E" }
+
+# 实测确定进的是这一份：`嵌套异常计数_第二份代码 = 1`，而 `CPU异常处理入口` 始终 0。
+# 它的唯一调用者是记录器 `0x081A_F4EC`，而记录器由 `0x0823_D72C` 在 `0x0823_D758` 处调用；
+# 这条链是在**空闲任务的休眠序列**里被走到的（前一行日志就是 L1 信箱握手 0x3181→应答 0x9000）。
+# 下面三条查"是谁、带什么编号请求了这次 trap"。
+[[patch]]
+addr = 0x0800_7EB0
+action = { kind = "count", label = "嵌套异常检查_实际入口" }
+
+[[patch]]
+addr = 0x0823_D72C
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "trap请求者" }
+
+[[patch]]
+addr = 0x0823_D72C
+action = { kind = "log_pair", reg = "r2", reg2 = "r3", label = "trap参数" }
+
+# 自旋实测：PC 停在 SRAM 0x4000a34c（ROM 镜像 0x08705F48 的 `bic r1,r1,#0xc0`，开关中断原语第 4 条），
+# 它的调用者是最深睡眠档的处理函数 `0x4000_8338`（表 0x0851_3920 末项 = 0x4000_8339），
+# 里面是一个**无条件**循环。
+# ⚠ 地址以前记错了一格（原写 `0x4000_834c: bl` / `0x4000_8350: b`）。用 capstone 对
+#   `dump/40008200_400.bin` 复核后的实际编码是：
+#     0x4000_834c: blx #0x40009440      ← 循环**之前**，每次进函数只跑一次
+#     0x4000_8350: bl  #0x4000822c      ← 循环体：每拍链
+#     0x4000_8354: b   #0x40008350      ← 无条件回边
+#   所以探针挂在 0x834C 上数到的是"进过停车函数几次"，**不是"转了几圈"**——
+#   实测 `睡在停车循环=9` 配 `[poll]` 里每心跳 3.6 万次 MMIO 读，正是这两者的差别。
+#   要数圈就把钩子挂到 0x4000_8350。
+[[patch]]
+addr = 0x4000_834C
+action = { kind = "count", label = "进停车函数" }
+
+[[patch]]
+addr = 0x4000_8350
+action = { kind = "count", label = "停车循环转圈" }
+
+# ---------- SIM 接口为什么没接通（任务 #13）----------
+# 链条：C 版 `cold reset` = SIM ops 表槽 0（`0x0803_56F8`，紧接 `bl 0x0806_425C` = `L1usim_Reset`）。
+# ops 表已登记（`[0xF0161E0C]=0xF0164050`），派发器 `0x080D_0EC0` 挂在 RAM 向量表 `0xF0161E1C..1E38`
+# 后面（所以 find_bl 看不见它的调用者）。全 ROM 只有一处把这张向量交给客户端：
+# `0x0805_D97C` 里的 `0x0805_D9CE: str r1,[r4,#0x10]`。而晚期转储里**没有任何字等于 0xF0161E1C**
+# ⇒ 那次 str 从未执行。它上游只有一道门（`0x0808_7062..706e`）：
+#   movs r0,1 ; lsls r0,r0,#0xa → 0x400 ; adds r0,r4,r0 ; ldrb r0,[r0,#0x10] ; cmp r0,0 ; bne <跳过领取>
+# 即读 `[r4+0x410]` 这个"该槽已初始化"标志。下面四条分清"根本没到"与"到了但标志非 0"。
+# 这四个地址原先都没有 hook —— 同址叠第二个 hook 会互吞（见记忆的假阴性第 3 条）。
+[[patch]]
+addr = 0x0808_706A
+action = { kind = "log_reg", reg = "r0", label = "领表门_标志地址" }
+note = "r0 = r4+0x400，下一条 ldrb [r0,#0x10] 读的就是这个标志"
+
+[[patch]]
+addr = 0x0808_706C
+action = { kind = "log_reg", reg = "r0", label = "领表门_标志值" }
+note = "非 0 就跳过领取，SIM 接口向量永远不会被交出去"
+
+[[patch]]
+addr = 0x0805_D9CE
+action = { kind = "log_pair", reg = "r4", reg2 = "r1", label = "客户端领取SIM接口向量" }
+note = "r4=客户端控制块，r1 应为 0xF0161E1C；出现即接口接通"
+
+[[patch]]
+addr = 0x0803_56F8
+action = { kind = "count", label = "cold_reset进入" }
+
+# ---------- 通往首帧的捷径：0xB59 这条（不经过 SIM）----------
+# MMI 主循环里"显示初始化"分支的判据是 `[rec+6] == 0xB59`（`0x0800_A0CE`，通过则进
+# `0x0800_A0E4` 的一次性 init 链）。发这条的不是 SIM：`0x080DE89C`（唯一调用者 `0x0820_5212`）
+# 在 `0x080DEC2C` 构造 msg id 0xB59、dst 0x46=MMI，再经 `0x0810_437A` + `0x0820_5F9C` 投出。
+# 它的门槛是状态字节 `[0xF021_AAA4]*0x18 + 0xF028_07A0/+0x15`、`+0xF028_07A4/+4`、
+# 以及 `[0xF021_AAAE] == 0`（`0x080DEA82..0x080DEA88`）——所以顺带把这两块 RAM 也导出来。
+# SIM 那边的派发器 `0x0801_479C` 一起挂，用来确认"SIM 没消息"与"0xB59 有没有发出"两件事分开。
+[[patch]]
+addr = 0x0801_479C
+action = { kind = "count", label = "SIM派发器进入" }
+
+[[patch]]
+addr = 0x0800_A0CE
+action = { kind = "count", label = "MMI的0xB59比较执行" }
+
+[[patch]]
+addr = 0x080DE89C
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "0xB59发信函数进入" }
+
+[[patch]]
+addr = 0x080DEC2C
+action = { kind = "count", label = "0xB59构造发出" }
+
+# 入口已定位：`0x0820_5194: push {r3,r4,r5,r6,r7,lr}`，switch 索引 = `ldrb [[0xF021_AAA4]]`
+# （运行时该字节 = 0x00），case 桩在 `0x0820_51FA/5200/5206/520C/5212`，其中 `5212 → 0x080DE89C`
+# 就是 0xB59 发信者。**直接调用者有 15 个，全部落在 0x0807_0Dxx..0x0807_10xx 这一个模块里**
+# ⇒ 问题从"谁调它"变成"那个模块跑没跑"。下面两条分清这两件事。
+[[patch]]
+addr = 0x0820_5194
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "0xB59分派器进入" }
+
+[[patch]]
+addr = 0x0807_0DE6
+action = { kind = "count", label = "分派器调用点0DE6" }
+
+# 二选一：注册桩（5 个调用者：0x081562B8 0x08172BA8 0x0819043E 0x081958D0 0x081A9606）
+# 是否执行；以及收表的例程 0x081BA0CC 是否被叫。两处原本都无 hook。
+[[patch]]
+addr = 0x081AF528
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "回调表注册桩" }
+
+# 收集"实际发过的 dst ← 发送者 PC"。挂在 0x0823_FE00 而不是 0x0823_FDFE：
+# 后者已有 `投递dst_id` 的 hook，同址叠第二个会被吞（本轮实测过的坑）。
+# 此处 r0 仍是 `0x0823_FD: ldrh r0,[r4,#2]` 取出的 dst id，lr 就是调用者。
+[[patch]]
+addr = 0x0823_FE00
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "dst与发送者" }
+
+[[patch]]
+addr = 0x081BA0CC
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "收表例程" }
+
+[[patch]]
+addr = 0x0837_0220
+action = { kind = "set_reg", reg = "r0", value = 1 }
+note = "直接宣布开机流程任务全部完成"
+
+[[patch]]
+addr = 0x081B_38D0
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "l1audio_sethandler" }
+note = "C 版这段共注册 5 个 handler：802fca5 805c96d 8058241 8046691 808fb85，我们只注册 805c96d（调用者 0x0802FBF6，前置字节标志 [r7,#2] 挡住重复）—— 后面 4 个注册点是分歧点"
+
+[[patch]]
+addr = 0x0808_7256
+action = { kind = "log_reg", reg = "r0", label = "sim_check_status" }
+
+[[patch]]
+addr = 0x080D_2EE0
+action = { kind = "log_reg", reg = "r2", label = "SIM_CMD 目标地址" }
+
+[[patch]]
+addr = 0x0819_F5B4
+action = { kind = "log_str", reg = "r0", label = "kal_debug_print" }
+
+[[patch]]
+addr = 0x082D_2A22
+action = { kind = "log_str_at", target = 0xF028_EDC4, label = "mr_sprintf" }
+
+[[patch]]
+addr = 0x081A_4D54
+action = { kind = "log_str", reg = "r0", label = "dbg_print" }
+
+[[patch]]
+addr = 0x083D_1C28
+action = { kind = "poke", target = 0xF016_6068, value = 0 }
+note = "mr_mem_get：初始化时这里被置 1，真机应为 0"
+
+[[patch]]
+addr = 0x0838_90C8
+action = { kind = "set_reg", reg = "r0", value = 1 }
+note = "srv_charbat_get_charger_status 假装在充电"
+
+[[patch]]
+addr = 0x080E_7482
+action = { kind = "copy_reg", reg = "r2", src = "r0" }
+note = "过 nvram_util_caculate_checksum"
+
+[[patch]]
+addr = 0x0809_3FB2
+action = { kind = "set_reg", reg = "r0", value = 1 }
+note = "强制过 sub_8093FFA"
+
+[[patch]]
+addr = 0x4000_801E
+action = { kind = "set_reg", reg = "r0", value = 1 }
+note = "sub_87035D4 返回点，不改则落到 0xE7FE 自跳转"
+
+[[patch]]
+addr = 0x080D_2CA4
+action = { kind = "poke_at_reg", reg = "r5", offset = 3, value = 0xFF, size = 1 }
+note = "C 版注释：不知道在做什么"
+
+# 原来这里挂了两条 `0x0806_01EC` / `0x0806_01AC` 的补丁，把 R0 写进 0x82000000，
+# 用来蒙过 `sub_8060194` 里"等 TDMA 帧号爬到目标值"的两个 while。
+# 现在 0x82000000 按硬件建模成自由递增的帧号（`Vm::tdma_frame`，一帧 4.615 ms），
+# 那两个循环自己就退出了，补丁删掉；C 版没有这个模型，所以只能靠写值蒙。
+
+[[patch]]
+addr = 0x0822_3F66
+action = { kind = "set_reg", reg = "r0", value = 0 }
+note = "过 sub_8223F5C（L1 层）"
+
+[[patch]]
+addr = 0x0800_DA28
+action = { kind = "set_reg", reg = "r0", value = 0 }
+
+[[patch]]
+addr = 0x0809_404A
+action = { kind = "poke", target = 0xA000_0000, value = 0x5555 }
+note = "过 sub_8094040（L1 层）"
+
+[[patch]]
+addr = 0x0809_4064
+action = { kind = "poke", target = 0xA000_0000, value = 0x5555 }
+
+# 这三条原来全挂在 `0x0800_17DC` 上 —— 同地址只有第一个钩子生效，所以 C 版预写的
+# `0x8200_0224` 与 `0x8200_0228` **我们从没写进去过**（启动自检现在会报出来）。
+# 拆开挂：`sub_80017C0` 里 `0x17DC..0x17E0` 是"等 `[r1,#0x1c]` bit1 清 0"的自旋，
+# `0x17D8` 在循环前跑一次，`0x17DE` 每圈都跑，`0x17DC` 保持原样（那颗是今天真正生效的，不动它）。
+[[patch]]
+addr = 0x0800_17DC
+action = { kind = "poke", target = 0x8200_021C, value = 2 }
+note = "过 sub_80017C0；固件会自己清掉，所以要在这一点重复预置"
+
+[[patch]]
+addr = 0x0800_17DE
+action = { kind = "poke", target = 0x8200_0224, value = 0xFFF0_0000 }
+
+[[patch]]
+addr = 0x0800_17D8
+action = { kind = "poke", target = 0x8200_0228, value = 660 }
+
+[[patch]]
+addr = 0x0803_A426
+action = { kind = "poke", target = 0x8205_0000, value = 0 }
+note = "过 sub_803A3D0 的 while"
+
+[[patch]]
+addr = 0x081A_194A
+action = { kind = "poke", target = 0x8106_0010, value = 2 }
+note = "继续过 SD 检测"
+
+[[patch]]
+addr = 0x0823_DBE0
+action = { kind = "log_str", reg = "r1", label = "kal_trace_mr" }
+
+[[patch]]
+addr = 0x0816_0194
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "SD_ReadSingleBlock" }
+
+# 里程碑探针：L1Audio 的 5 个 handler 注册点里，除 0x0802FBF2（上面那条）之外的 4 处。
+# C 版日志（target/ref_boot.log）里前 5 个 l1audio_sethandler 各来自一处；我们现在只有
+# 0x0802FBF2 会响，这 4 处响了就说明对应的初始化任务真的跑起来了。
+[[patch]]
+addr = 0x0801_7C08
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "注册点1(802fca5)" }
+
+[[patch]]
+addr = 0x0802_CF08
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "注册点3(8058241)" }
+
+[[patch]]
+addr = 0x0802_0E06
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "注册点4(8046691)" }
+
+[[patch]]
+addr = 0x0805_AB22
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "注册点5(808fb85)" }
+
+# 里程碑探针：固件往 PWDKEY(0x8003_0000) 写请求。**bit0=1 是关机**，0 是睡眠；lr 给决策者。
+# 现在开机轨迹里会出现三次：0x2204@LR=0x08001063（早期睡眠）、0x2205@LR=0x080010CD（关机请求，
+# 我们没建模 PWDKEY 所以继续跑）、0x2205@LR=0x081B935B（自带 `b .` 的关机例程 → 仿真到此为止）。
+# 注意：这条也走 `[fw]` 前缀，所以开着它时 `fw` 计数 = 真实固件行数 + 3，别拿总数当深度。
+[[patch]]
+addr = 0x0819_EC76
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "PWDKEY写入" }
+
+# 里程碑探针：任务创建点（唯一的创建路径：0x080047D4 的开机循环 → 0x08006458 → 这里）。
+# r0 是任务名指针，打出来就是"本次开机到底建了哪些任务"。
+[[patch]]
+addr = 0x0800_648E
+action = { kind = "log_str", reg = "r0", label = "创建任务" }
+
+# 里程碑探针：两个关键任务的入口 main（来自 0x0850EE18 的 96 槽任务表）。
+# L1AUDIO 的 main 里第一件事就是 bl 0x0800_DD1C（l1audio_init），所以它响不响直接区分
+# "任务没被调度" 和 "任务跑了但被前置条件挡住"。
+[[patch]]
+addr = 0x0800_B9AC
+action = { kind = "log_reg", reg = "r0", label = "L1AUDIO main" }
+
+[[patch]]
+addr = 0x0800_CAC0
+action = { kind = "log_reg", reg = "r0", label = "SIM main" }
+
+# 里程碑探针：L1AUDIO 任务的卡点。二分出来的链条是
+#   main 0x0800_B9AC → bl 0x0800_DD1C(l1audio_init) → 0xDD6C bl 0x17DC8 ✓返回
+#   → 0xDD72 bl 0x081E_72F0(r0=3) → 0x1E72FE bl 0x082D_0E4C → 0x2D0E70 bl 0x2D1B84 ✓返回
+#   → 0x2D0E76 bl 0x0824_40EC(1) → 0x244106 bl 0x0810_2344(1)（当前 TCB 的 +0xC 必须是 "KSTA"）
+#   → 0x10235A bl 0x0812_3458(1) → 0x12346E bl 0x081C_7A1E = **带 1 tick 超时的内核对象等待**
+# 这条不响 = 任务还堵在那个等待里；响了 = 超时/投递通了，往下就是 4 个注册点。
+[[patch]]
+addr = 0x0800_DD76
+action = { kind = "log_reg", reg = "r0", label = "L1AUDIO 过了 0x1E72F0(3) 的等待" }
+
+
+
+
+
+
+
+
+
+
+
+[[patch]]
+addr = 0x4000_82F8
+action = { kind = "count", label = "CTIRQ1 LISR" }
+
+[[patch]]
+addr = 0x0813_1E62
+action = { kind = "log_reg", reg = "r5", label = "图层 pending 已置" }
+
+# LCD 初始化里 `while ((u16)[0x90000000] & 1) ;` 的**出口**（0x0839_AF00 是循环头，
+# 0x0839_AF06 是落空之后走的下一句）。挂在这里而不是循环头，是因为只有这个点能一次
+# 回答两件事：忙位是不是真的清 0 了，以及固件过完握收之后还走不走得动。
+# 回归哨兵：同一位还有个读者 `0x0813_1E62`（上面那条 `图层 pending 已置`），
+# 它要是从非 0 掉回 0，说明忙位改过头了。
+[[patch]]
+addr = 0x0839_AF06
+action = { kind = "count", label = "LCD复位握收已过" }
+
+# ---------- 画屏侧（第二关）：C 版作者自己留在 `docs/hook备份.c` 的三个里程碑打印 ----------
+# 这三处都不是我们猜的：`hook备份.c:497 / :380 / :340` 原来就是 printf("gdi_init() start")、
+# printf("mmi_bootup_flow_completed")、printf("mmi_frm_scrn_enter(parent_id:%d)")，
+# 说明 C 版当年也是靠这三个点看"固件到底有没有开始画"。现在改挂我们的计数探针。
+# 全部与已有探针地址互不相同（同地址两个 hook 会互相吞）。
+[[patch]]
+addr = 0x0800_A0F2
+action = { kind = "count", label = "gdi_init起点" }
+
+# ---------- MMI 画屏链的分岔判据（子代理报告 + 我 capstone 复核条件码后选定）----------
+# `0x0800_A0C8: ldrh r0,[r3,#0x22] ; ldr r1,[=0xFFFFF4A7] ; adds r1,r0,r1 ; 0x0800_A0CE: beq 0x800a0e4`
+# 老探针 `MMI的0xB59比较执行` 只证明这句**执行过**（每条被派发的消息都会路过它），
+# **不证明分支命中**。下面前两条专治这个歧义：落空才走 A0D0，命中才走 A0E4。
+[[patch]]
+addr = 0x0800_A0D0
+action = { kind = "count", label = "0xB59比较未命中" }
+
+[[patch]]
+addr = 0x0800_A0E4
+action = { kind = "count", label = "进显示初始化分支" }
+
+# `sub_81A7F00`（一次性 GDI/显存初始化）的闩锁 `[0xF01D4C6C]`（byte）。置位者唯一：
+# `0x081A7F10 strb r1(=1),[r0]`，而常量 `0xF01D4C6C` 全 ROM **只出现在 `0x081A7F4C` 一处**
+# ⇒ 没有别人能读写它，也永不复位。它全 ROM 有 7 个调用者
+# （0x0800A0F2 / 0x0800DB76 / 0x0815E4D4 / 0x081A0B1A / 0x0832E9A6 / 0x08378092 / 0x0837ABB6）。
+#
+# ⚠ **原来这条标签是错的**（2026-09-25 复核后改名）：`0x081A_7F46` 是 `gdi_init` 的**公共出口**
+# —— 闩锁短路那条 `bne 0x81A7F46` 和正常路径 `0x081A7F42 bl 0x834B3DC` 落下来**都经过它**，
+# 所以它和 `0x081A_7F0E` **不互斥**，"被闩锁跳过 = 4"从来没证明过它名字说的那件事。
+# 实测真值只能读到：`gdi_init` 共被调 5 次，其中 1 次真做初始化（`0x081A_7F0E`=1）。
+# 要分清"几次是被闩锁挡的"，得改挂闩锁判定的**分支目标**上，不是这条出口。
+[[patch]]
+addr = 0x081A_7F0E
+action = { kind = "count", label = "GDI初始化首次执行" }
+
+[[patch]]
+addr = 0x081A_7F46
+action = { kind = "count", label = "gdi_init公共出口(两条路都经过,不代表被跳过)" }
+
+# 图层 0 显存 `0x10280` 的来源：`0x0836F1D2: bl 0x0823F35A`（r0=0x35A80 大小, r1=0x25CC4 类型）
+# 从 MedMem/SDRAM 抓取，返回值存 `[0xF01D5F18+0x10]`。这条计数为 0 就说明显存从没分配过。
+[[patch]]
+addr = 0x0836_F1D6
+action = { kind = "count", label = "显存抓取返回" }
+
+# 显示总初始化（唯一做完整 LCD/GDI 上电的 `sub_800DB74`）。子代理静态判定它的调用块
+# `0x0800_A13C/140/158/178/184` 无任何引用、进不去；这条实测用来**证伪或证实**那个判断，
+# 不预设结论。
+[[patch]]
+addr = 0x0800_DB76
+action = { kind = "count", label = "显示总初始化入口" }
+
+[[patch]]
+addr = 0x0834_7CE0
+action = { kind = "count", label = "开机流程走完" }
+
+[[patch]]
+# ⚠ 这个点**过去被标成"进入某屏幕"，是错的**（2026-09-25 复核反汇编后改名）。
+# `0x08245B68` 有 **311 个 BL 调用点**，函数体开头就是 `cmp r0,#5 / bne 0x8245c3c`
+# —— 是个**按 r0 分派的通用助手**，不是 `mmi_frm_scrn_enter`。
+# 所以它的计数**不能**当"MMI 进了几次屏"用。要看进屏，用下面这对真判据：
+# `0x0800A0D0`（0xB59 比较落空）与 `0x0800A0E4`（命中→一次性显示初始化链）。
+addr = 0x0824_5B68
+action = { kind = "count", label = "r0==5分派助手(不是进屏!)" }
+
+# GDI 逐图层提交 `sub_8131E30`（真入口是 1E30，不是 1E00）的门，逐条 capstone 复核过的形状：
+#   1E3A ldrh r0,[r2=0x90000000] ; 1E3C lsls r0,#0x1f ; 1E3E bne 1E48
+#   ⇒ `LCD_ON` 为 1 **跳过**状态判据直接提交；为 0 才 `bl 0x081E1F3C` 问 `[0xF01D2A5C]`
+#      ∈ {0x17,0x18}，不是就 `beq 1EAE` 返回。
+# 我们现在恒答 0，所以这两条一起看就能分清三种情况：
+#   1E40=0            → 这个函数根本没被调用（唯一的 BL 点是 `0x0825_4B42`）
+#   1E40>0 且 1E48=0  → 调用了，但卡在显示状态判据上（那就是下一道墙）
+#   1E48>0            → 过了门，往下看 `0x0813_1E62`（pending 标志已置）
+[[patch]]
+addr = 0x0813_1E40
+action = { kind = "count", label = "GDI问显示状态" }
+
+[[patch]]
+addr = 0x0813_1E48
+action = { kind = "count", label = "GDI过门开始提交" }
+
+# 显示状态字节 `[0xF01D2A5C]` 的唯一 0x17 生产者（0x18 只在已是 0x17/0x18 时才写，自锁无独立来源）：
+# `0x0812_B0A4: movs r1,0x17 ; 0x0812_B0A6: bl 0x082F8F58`。它 0 命中就说明画屏状态机根本没推进。
+[[patch]]
+addr = 0x0812_B0A6
+action = { kind = "count", label = "写显示状态0x17" }
+
+# 显示状态机的动态取证：写入原语 `sub_82F8F58(r0=使能, r1=新值)` 的入口，打 **新值 ← 调用者**。
+# 实测 `[watch]` 已经抓到取值只会走 `0 → 2 → 6 → 2`，这条给出每一步是谁写的，
+# 用来把"从 6 到 0x17 缺的那一跳"从静态推断变成直接观测。
+[[patch]]
+addr = 0x082F_8F58
+action = { kind = "log_pair", reg = "r1", reg2 = "lr", label = "显示状态写入" }
+
+# `0x0812_B0A2: ldr r0,[sp,#0x4c] ; movs r1,0x17 ; bl 0x082F8F58` 的序言处。
+# 与上面 `写显示状态0x17` 配对看：这里 >0 而那里 =0 ⇒ 函数进去了但 `[sp,#0x4c] != 1` 被守卫弹回。
+[[patch]]
+addr = 0x0812_B0A2
+action = { kind = "count", label = "0x17生产者守卫处" }
+
+# ---------- L1↔LCD 寄存器访问服务的读写分岔（`sub_812AECC` 一族）----------
+# 实测证据：`[0xF01D2A5C]`（GDI 提交门要求它 ∈ {0x17,0x18}）整轮只被写过 `2 → 6 → 2`，
+# 三次调用者 `lr = 0x0837B073 / 0x0812B021 / 0x0812B36D`，其中 `0x0812B021` 就出自
+# `0x0812B01C: bl 0x082F8F58`（前面 `0x0812B018: ldr r0,[sp,#0x4c] ; movs r1,#6`）。
+# 而置 0x17 的那条在**同一个模块的另一侧**：`0x0812AFB6: ldrb r0,[r4,#8]`
+#   `==0 → bne/beq 0x0812B00A`（写事务，就是上面那条 6）
+#   `==1 → 落到 0x0812AFD0 … 0x0812AFE2` 按 `[r4,#0x1c]` 分派到 0x8000_0000/0x9000_0000/0x1000_0000，
+#          三条都汇到 `0x0812B006 → 0x0812B086`，最后 `0x0812B0A6` 写 0x17。
+# 所以这四条计数要回答的就一句：**读事务这一侧到底有没有被发起过。**
+[[patch]]
+addr = 0x0812_AF5A
+action = { kind = "count", label = "L1访问服务入口" }
+
+[[patch]]
+addr = 0x0812_AF96
+action = { kind = "count", label = "L1访问进到地址分派" }
+
+# 读侧探针刻意挂在 `0x0812AFD4` 而不是 `0x0812AFD0`：AFD0 那句 `bl 0x082D3630` 在
+# `[0xF01F15FC] != 0` 时会被跳过，挂它会造出"读侧没跑"的假阴性；AFD4 才是读侧的必经点。
+[[patch]]
+addr = 0x0812_AFD4
+action = { kind = "count", label = "L1访问-读事务侧" }
+
+[[patch]]
+addr = 0x0812_B00A
+action = { kind = "count", label = "L1访问-写事务侧" }
+
+# 分岔取的那颗字节本身：`0x0812AFB6: ldrb r0,[r4,#8]` 之后紧跟 `0x0812AFB8: cmp r0,#0`，
+# 所以在 AFB8 处 r0 就是描述符的 byte8。==0 走写事务（今天唯一在走的一条），==1 才可能写 0x17。
+[[patch]]
+addr = 0x0812_AFB8
+action = { kind = "log_reg", reg = "r0", label = "通道描述符byte8" }
+
+# `sub_812AAA0`（LCD/GDI 通道"打开并重编程"，0x0812AAA0..0x0812B3E2）全 ROM 只有一个调用者
+# `0x0822_0182: bl 0x0812AAA0`，而 `sub_822014A` 的上游是 6 个"栈上现场构造描述符"的任务级站点。
+# 这 7 条一起看就知道：是谁该再打开一次通道、以及那 6 条路里哪几条在本轮根本没跑。
+[[patch]]
+addr = 0x0822_014A
+action = { kind = "count", label = "通道打开包装入口" }
+
+[[patch]]
+addr = 0x0822_0182
+action = { kind = "count", label = "调用通道打开那一句" }
+
+[[patch]]
+addr = 0x0809_0598
+action = { kind = "count", label = "上游1(0x080903xx)" }
+
+[[patch]]
+addr = 0x080D_BF6C
+action = { kind = "count", label = "上游2(0x080DBF04)" }
+
+[[patch]]
+addr = 0x080D_CE26
+action = { kind = "count", label = "上游3(0x080DCB84)" }
+
+[[patch]]
+addr = 0x082D_9700
+action = { kind = "count", label = "上游4(0x082D96BC)" }
+
+[[patch]]
+addr = 0x0832_0C36
+action = { kind = "count", label = "上游5(0x08320B74)" }
+
+[[patch]]
+addr = 0x083E_7284
+action = { kind = "count", label = "上游6(0x083E7234)" }
+
+# 静态断言：上游 6 里 `0x083E726A` 显式 `strb r0(=0),[sp,#8]` ⇒ 它只能走写侧。挂上验证。
+[[patch]]
+addr = 0x083E_726A
+action = { kind = "count", label = "上游6强制byte8为0" }
+
+# ---------- 三个"以读模式再打开一次通道"的候选站（byte8 都是硬编码 movs #1）----------
+# 静态逐个核过（见 memory 里那三行反汇编），B/D/F 可判定恒 0，只剩 A/C/E：
+#   A `sub_80DBF04`(ddload.c，读 LCM 参数那条)：`0x080DBF18 strb #1,[sp]` + `0x080DBF1E strb #1,[sp,#8]`
+#     活闸 `0x080DBF50: ldrb r0,[0xF021FD08+0x20,#0x11] ; cmp #1 ; 0x080DBF54: bne 0x80dbf70` ⇒ **[0xF021FD39]==1**
+#   C `sub_809032C`：闸1 `[0xF01E3325] != 0`（写者在 `0x080A47A4`），闸2 `[0xF021FB5C] == 1`（**没找到写 1 的点**）
+#   E `sub_8320B74`：闸1 `[[0x3C + arg] 字节] == 1`，闸2 `[0xF031F090] == 0`
+# 每站两条：入口 = 有没有走到这条路；"闸已过" = 是不是被闸挡住。入口>0 而闸过后=0 就是结论。
+[[patch]]
+addr = 0x080D_BF04
+action = { kind = "count", label = "A站入口(ddload读LCM)" }
+
+[[patch]]
+addr = 0x080D_BF56
+action = { kind = "count", label = "A站闸已过" }
+
+[[patch]]
+addr = 0x0809_032C
+action = { kind = "count", label = "C站入口(显示模式切换)" }
+
+[[patch]]
+addr = 0x0809_0566
+action = { kind = "count", label = "C站闸1已过" }
+
+[[patch]]
+addr = 0x0832_0B74
+action = { kind = "count", label = "E站入口(按层开屏)" }
+
+[[patch]]
+addr = 0x0832_0BC2
+action = { kind = "count", label = "E站闸1已过" }
+
+# ---------- 差分探针：先证伪"探针本身"，再谈结论 ----------
+# 起因：`0x0824_5B68` 上我们挂的计数整轮 0 命中，而静态查出它有 **311 个 BL 调用点**。
+# 这两件事不能同时成立得让人放心，所以按"同一个函数体往里 4 条指令"再挂一颗：
+# 若 5B68=0 而 5B74>0，说明是钩子/别名层面的问题，不是固件没跑（本项目已经吃过
+# "同址两钩子互吞"和"只钉一个别名"两类假阴性，别再靠猜排除第三类）。
+[[patch]]
+addr = 0x0824_5B74
+action = { kind = "count", label = "投递助手体内4条" }
+
+# `0x0824_5B68` 的 311 个调用点里**只有一个**传常量 5（其余 176 个传内存值、76 个传寄存器）：
+[[patch]]
+addr = 0x0834_BD8C
+action = { kind = "count", label = "唯一传常量5的调用点" }
+
+# 它前面的状态闸：`bl 0x081C_0DCC` 只是 `ldrb [0xF029EEA3]`（电量/充电状态），要 ∈ {2,3,5} 才放行
+[[patch]]
+addr = 0x0833_10C8
+action = { kind = "count", label = "电量状态闸求值" }
+
+[[patch]]
+addr = 0x0833_10E6
+action = { kind = "count", label = "电量状态闸放行" }
+
+# `开机流程走完`(0x0834_7CE0) 静态查 BL 交叉引用为 0，唯一的引用是**函数指针**：池
+# `0x0832_CC38 = 0x0834_7CE1`，由 `0x0832_CC18` 取用 ⇒ 它只能被 proc-con 回调唤醒。
+# 这两条分开挂，就能把"没登记回调"与"登记了但没人回调"分清楚。
+[[patch]]
+addr = 0x0832_CC18
+action = { kind = "count", label = "开机完成回调已登记" }
+
+[[patch]]
+addr = 0x0832_CBE8
+action = { kind = "count", label = "Bootup注册器(表可达)" }
+
+# 向 MMI 任务投递回调的那条 API（与 `0x0837_24E4` 同族），确认它到底可不可用
+[[patch]]
+addr = 0x0837_1440
+action = { kind = "count", label = "MMI回调投递API" }
+
+# ---------- NVRAM 是不是在满速空转（当前唯一在跑的任务）----------
+# 实测账本：片 2400 起"当前任务"一直是 NVRAM，状态 0（就绪、没挂起），其余 38 个"等队列消息"、
+# 6 个"等事件组"，而应用级计数从片 3004 起全冻。NVRAM 体内**没有任何 MMIO 忙等**（子代理闭包核过），
+# 所以只可能是它的消息环不睡觉。它的环是 `0x0800BD6E..0x0800BDA2`，**两条出口都跳回 0x0800BD6E**：
+#   0x0800BD6E ldrb r0,[r4] ; *0x34 ; +[0xF016B0A4] ; 0x0800BD78 ldr r0,[r0,#0x14]  ← 用**索引**查描述符表拿队列句柄
+#   0x0800BD7C bl 0x08239D58（收信包装）
+# 而包装第一句 `0x08239D5E: cmp r0,#0 / bne` ⇒ 句柄为 0 时只打个 trace 就**照样继续拿 NULL 去收信**，
+# 收信立刻返回错误 ⇒ 满速空转。这三条计数就是验这个：环圈数、NULL 分支次数、有没有真进派发。
+[[patch]]
+addr = 0x0800_BD6E
+action = { kind = "count", label = "NVRAM环每圈" }
+
+[[patch]]
+addr = 0x0823_9D62
+action = { kind = "count", label = "收信句柄为空分支" }
+
+[[patch]]
+addr = 0x0800_BD8C
+action = { kind = "count", label = "NVRAM进派发" }
+
+# NVRAM 不是空转也不是句柄为空（实测：`NVRAM环每圈=21`、`收信句柄为空分支=0`、`NVRAM进派发=21`），
+# 而是**进去了没出来**：4018 片里只转了 21 圈，且内核账本 `ready_prio=0xCE`、`next_tcb=cur=0xF01887C0`
+# 都指着它。派发器 `sub_080131CC` 有 1B 个 case，目标是下面这 9 个 handler（逐个核过都是
+# `push {…,lr}` 真入口）。判读法：**9 个入口之和 > `NVRAM派发已返回` 的那一个，就是它卡住的 handler**；
+# 若相等则说明它其实回到了环里、卡在收信上（那结论又不同）。
+[[patch]]
+addr = 0x0800_BD90
+action = { kind = "count", label = "NVRAM派发已返回" }
+
+[[patch]]
+addr = 0x0802_3030
+action = { kind = "count", label = "NVRAM处理a" }
+
+[[patch]]
+addr = 0x0802_3174
+action = { kind = "count", label = "NVRAM处理b" }
+
+[[patch]]
+addr = 0x0802_325C
+action = { kind = "count", label = "NVRAM处理c" }
+
+[[patch]]
+addr = 0x0802_3338
+action = { kind = "count", label = "NVRAM处理d" }
+
+[[patch]]
+addr = 0x0802_348C
+action = { kind = "count", label = "NVRAM处理e" }
+
+[[patch]]
+addr = 0x0802_34FC
+action = { kind = "count", label = "NVRAM处理f" }
+
+[[patch]]
+addr = 0x0802_3644
+action = { kind = "count", label = "NVRAM处理g" }
+
+[[patch]]
+addr = 0x0802_37B0
+action = { kind = "count", label = "NVRAM处理h" }
+
+[[patch]]
+addr = 0x0802_3838
+action = { kind = "count", label = "NVRAM处理i" }
+
+# 派发器 `0x080131DA: ldrh r1,[r0,#6]` 取的就是消息 id（`[msg+6]`，与 `0xB59` 那套同一约定），
+# 下一条 `0x080131DC` 处 r1 还活着 ⇒ 在这里打 id。21 次派发只 20 次返回，
+# **最后一行 id 就是卡住 NVRAM 的那条消息**，再用下面的跳表对到 handler。
+[[patch]]
+addr = 0x0801_31DC
+action = { kind = "log_reg", reg = "r1", label = "NVRAM派发消息id" }
+
+# `0x081A06A6: b #0x81a06a6` 是"任务终止后原地自旋"的那一句（`0x081A0698` 桩里
+# `bl 0x81A060C → blx 0x8000340 → bl 0x801E998` 之后就是它）。挂这一条是为了把
+# "assert  fired → 终止自旋"与"handler 里另有等待"分开：它 =0 就排除前者。
+[[patch]]
+addr = 0x081A_06A6
+action = { kind = "count", label = "终止后原地自旋" }
+
+# 实测点名：最后一次派发 id = **0x25D9** → handler `0x08023644`（`NVRAM处理g=1`、`派发已返回=20/21`、
+# `终止后原地自旋=0`），而 handler 内部 161 条指令里**没有自环** ⇒ 它是往下某个被调函数没回来。
+# 下面 7 条就是它那 7 个 `bl` 的**返回点**：哪一条是最后被命中的，它就死在那次调用里面。
+# （`0x080236F0` 那句是 `blx 0x826E634`，ARM `ldr pc,[pc,#-4]` 跳板，落进 RAM 补丁表，单独留意。）
+[[patch]]
+addr = 0x0802_3654
+action = { kind = "count", label = "g返回0-取上下文" }
+
+[[patch]]
+addr = 0x0802_36BE
+action = { kind = "count", label = "g返回1-取属性" }
+
+[[patch]]
+addr = 0x0802_36EC
+action = { kind = "count", label = "g返回2-分配" }
+
+[[patch]]
+addr = 0x0802_3704
+action = { kind = "count", label = "g返回3-分区取回" }
+
+[[patch]]
+addr = 0x0802_3734
+action = { kind = "count", label = "g返回4-释放" }
+
+[[patch]]
+addr = 0x0802_3756
+action = { kind = "count", label = "g返回5-释放2" }
+
+[[patch]]
+addr = 0x0802_376E
+action = { kind = "count", label = "g返回6-ack后" }
+
+# ---------- 真正的"把一帧推给硬件"：`sub_835CF30` ----------
+# 子代理表里最硬的一条：它先读 `DISP_STAT` bit0，**为 1 就直接返回、本帧不提交**（并给 busy 计数 +1），
+# 为 0 才 `strh 0,[0x9000000C]` 再 `strh #0x8000,[0x9000000C]` 踢一帧。我们目前把合成挂在
+# "写 0xC 为 0"上，与这条的先后关系要靠这三计数确认，别再凭猜测改模型。
+[[patch]]
+addr = 0x0835_CF30
+action = { kind = "count", label = "帧提交入口" }
+
+[[patch]]
+addr = 0x0835_CF4C
+action = { kind = "count", label = "帧被拒(bit0=1)" }
+
+[[patch]]
+addr = 0x0835_CF80
+action = { kind = "count", label = "踢帧(写0xC=0x8000)" }
+
+# 里程碑探针：C1XX 重挂下一次比较的函数入口 `0x081A_162E`（唯一直接调用者 0x081B4F42，
+# 另经 RAM 分发器 0x4000_8370 进来）。**基线档（ctirq1=true/line=1）下它一次都不响**，
+# 而 `0x8200_0238` 整次开机只被写一次也与此一致；换成 line=2 + periodic_ms=5 它会响 207 次
+# （调用者 LR=0x40008398），但 `[fw]` 轨迹并未变深。它响 = 重挂这条链活了。
+# 已实测的门：[0xF01DBAE8]=0 放行、[0xF015DE6C]=1 放行、[0xF032944C+0x13/0x14] 放行，
+# 而 **[0xF015F17E] 需要 ==1，实测整次开机只被 0x08123392 写过一次 0** —— 基线档下卡在这。
+[[patch]]
+addr = 0x081A_162E
+action = { kind = "count", label = "C1XX 重挂" }
+
+# ---------- 内核定时器链条计数（任务 #12）----------
+# 静态读码读出来的真身（SRAM 镜像 = ROM 地址 + 0x3790_4404，由 `0x087060D4 ↔ 0x4000A4D8` 定死）：
+#   NU_Increment_Clock  0x4000A4D8：[AD20]++；然后 **只有 [AD2C]==0 才** [AD28]--，
+#                        减到 0 才走 0x4000A518 把 [AD2C] 置 2
+#   0x4000A560：尾部判据 `[AD2C]==2 || [AD38]==2` 才继续，否则直接 bx lr
+#   0x4000A578：取 0x4000AD3C 交给 0x4000A108（"挂到就绪表"例程）
+#   0x4000A108：只写 obj+0x40（已在表标记）和就绪表 0x4000B228[prio]/0x4000B21C[prio]/[B234]，
+#               优先级取 obj+0x1A —— **它一个字节都不碰 obj+0x00**
+#   0x08001A46：系统中断任务的入口，第一句 `ldr r0,[r0] ; cmp r0,#2` 决定是否调超时扫描
+#   0x08002800：NU_Decrement_Timeouts；扫描尾部 0x080028AE 清 [AD14]、把 [AD24] 装成头节点的
+#               delta，再 `blx 0x08201AD8` → 0x4000A468 重载定时器（那句就是 [AD28]=r0;[AD2C]=0）
+# 所以"扫描不跑"的候选断点从 6 个减到这几个计数器的第一个 0。
+[[patch]]
+addr = 0x4000_A4D8
+action = { kind = "count", label = "时钟递增" }
+
+[[patch]]
+addr = 0x4000_A518
+action = { kind = "count", label = "倒计时归零置2" }
+
+[[patch]]
+addr = 0x4000_A560
+action = { kind = "count", label = "尾部判据" }
+
+[[patch]]
+addr = 0x4000_A578
+action = { kind = "count", label = "让系统任务就绪" }
+
+[[patch]]
+addr = 0x4000_A108
+action = { kind = "count", label = "挂就绪表入口" }
+
+[[patch]]
+addr = 0x4000_A138
+action = { kind = "count", label = "挂就绪表_首次入表" }
+
+[[patch]]
+addr = 0x4000_A468
+action = { kind = "count", label = "重载定时器" }
+
+[[patch]]
+addr = 0x0800_1A4E
+action = { kind = "count", label = "超时扫描_被调" }
+
+[[patch]]
+addr = 0x0800_2800
+action = { kind = "count", label = "超时扫描_进入" }
+
+[[patch]]
+addr = 0x0800_28AE
+action = { kind = "count", label = "超时扫描_收尾" }
+
+# 定时器链表插入 0x081A010C 的三条分支：空表 / 非表头 / 已经在跑
+[[patch]]
+addr = 0x081A_010C
+action = { kind = "count", label = "定时器插入" }
+
+[[patch]]
+addr = 0x081A_011A
+action = { kind = "count", label = "定时器插入_空表" }
+
+[[patch]]
+addr = 0x081A_012E
+action = { kind = "count", label = "定时器插入_非空" }
+
+# 挂 1-tick 超时等待的那个内核调用（L1AUDIO 卡的那一步就调它）
+[[patch]]
+addr = 0x081C_7A1E
+action = { kind = "count", label = "带超时挂起" }
+
+# 上面那条计数与这条打印挂在同一个地址上，也是在验证"同一地址挂两个 hook 都会响"：
+# 两条的数量必须相等，否则整张补丁表的挂法就有问题。
+# r0 是等待者的 TCB —— 与 `L1AUDIO main(0xf0194ad4)` 对得上就是它。
+[[patch]]
+addr = 0x081C_7A1E
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "谁在挂超时" }
+
+# L1AUDIO 那条链自己的等待点（`0x08123458` 里 `bl 0x081C7A1E`）：r0=TCB，r1=原因码
+[[patch]]
+addr = 0x0812_346E
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "L1AUDIO 的等待" }
+
+# 超时扫描里"到期节点 → 等待对象"的那一句（`ldr r0,[r4,#0x24]`，r4 = 节点+8 的等待者）。
+# 它打出来的 TCB 就是被唤醒的任务，用来判定扫描到底唤醒了谁。
+[[patch]]
+addr = 0x0800_2858
+action = { kind = "log_pair", reg = "r4", reg2 = "r5", label = "扫描唤醒的任务" }
+
+# 扫描读到的第一个到期节点：r5 = 节点地址（= 等待者 TCB + 0x78），r0 = 该节点的 delta。
+# 与 `L1AUDIO 的等待(0xf01952d8)` 对一下就知道等的那个节点是不是它的。
+[[patch]]
+addr = 0x0800_284E
+action = { kind = "log_pair", reg = "r5", reg2 = "r0", label = "扫描_到期节点" }
+
+# 紧接着的 `ldr r0,[r5] ; cmp r0,#1` 测的是 Nucleus 的 `TM_TCB.tm_timer_type`
+# （`TM_TASK_TIMER = 0`、`TM_APPL_TIMER = 1`，字段序见开源同代源码 tc_defs.h/tm_defs.h）：
+# type==1 → 尾部分派 `ldr r1,[sp] ; blx r1` 调应用定时器的到期函数；
+# type==0 → `0x28a6: r0=[sp,#8] ; bl 0x080039EC`（TC_Activate_Thread）唤醒任务。
+# 实测这里读回 0，走的就是任务唤醒那条路，是对的。
+[[patch]]
+addr = 0x0800_2850
+action = { kind = "log_pair", reg = "r5", reg2 = "r0", label = "扫描_节点类型" }
+
+# 节点是嵌在 TCB 里的 `tc_timer_control`（TCB+0x78），三个字段按源码是
+# +0 tm_timer_type、+4 tm_remaining_time、+8 tm_information、+0xC/+0x10 链表前后指针。
+# 对任务定时器来说 tm_information **按定义就是那个 TCB**，不是谁忘了初始化。
+# 实测 `[node+8] = 0xf01952d8` = L1AUDIO 的 TCB，`0x080039EC` 也确实收到它 —— 这一环是好的。
+[[patch]]
+addr = 0x0800_288C
+action = { kind = "log_pair", reg = "r0", reg2 = "r5", label = "扫描_唤醒对象" }
+
+# 唤醒例程入口。实测 r0 = 0xf01952d8 = L1AUDIO 的 TCB、lr = 0x080028AD（就是上面那条 bl 的返回
+# 地址），说明"[node+8] 是垃圾指针"这个怀疑是错的 —— 唤醒调用是对的、参数也对。
+# 注意不要在 `0x28a6`（`ldr r0,[sp,#8]` 这一句本身）挂读 r0 的探针：那时装载还没发生，
+# 读到的 r0 是上一个循环留下的 0x4000B24C，会把人带偏。
+[[patch]]
+addr = 0x0800_39EC
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "resume入口" }
+
+# ---------- 唤醒之后重新堵在哪一环（二分返回点）----------
+# 已证实的链条：main 0x0800B9AC → l1audio_init 0x0800DD1C → 0xDD72 bl 0x081E72F0(3)
+#   → 0x1E72FE bl 0x082D0E4C → 0x2D0E76 bl 0x082440EC(1) → 0x244106 bl 0x08102344(1)
+#   → 0x10235A bl 0x08123458(1) → 0x12346E bl 0x081C7A1E（=超时等待，**已被扫描唤醒**）
+# 下面每处都是对应 `bl` 的返回地址，哪一处开始是 0，任务就重新堵在哪一层的下一个调用上。
+[[patch]]
+addr = 0x0812_3472
+action = { kind = "count", label = "返回123458" }
+
+[[patch]]
+addr = 0x0810_235E
+action = { kind = "count", label = "返回102344" }
+
+[[patch]]
+addr = 0x0824_410A
+action = { kind = "count", label = "返回2440EC" }
+
+[[patch]]
+addr = 0x082D_0E7A
+action = { kind = "count", label = "返回2D0E4C" }
+
+[[patch]]
+addr = 0x081E_7302
+action = { kind = "count", label = "返回1E72F0" }
+
+# ---------- 进到 0x081E72F0 内部的地标（读到底后的断点定位）----------
+# 反汇编出来的函数体是：
+#   72F0 push；r6=r0(=3)；[sp]=1；bl 0x2D0AD8；bl 0x2D0E4C（← 超时等待在里面，已证实被唤醒）
+#   7302 bl 0x312020 → 非 0 就 assert(0x20C)
+#   7312 按 r6 分流取一张表指针 r4（r6==3 → 0x0852B098）
+#   734C while ((u16)[0xA1000480] bit15) { 每 10 次 trace 一次; bl 0x2440EC(1) 睡 1 tick }
+#   7372 bl 0x3122C8 → 必须返回 1，否则 assert(0x2B9)
+#   7382 (1<<r6)|0x8000 → strh [0xA100047E]；[0x820C0008]=0
+#   73B6 while ((u16)[0xA10003F6] != 0x8888) { 纯自旋，每 0x20000 次 trace 一次 }   ← 不睡！
+#   73D2/73E4 bl 0x26744C(4, …) 两次（从 0x08525174 / 0x08522AE0 取三元组）
+# 哪一段之后计数不再涨，任务就堵在哪一段。
+[[patch]]
+addr = 0x081E_7306
+action = { kind = "count", label = "72F0过了③312020" }
+
+[[patch]]
+addr = 0x081E_7312
+action = { kind = "count", label = "72F0进分流" }
+
+[[patch]]
+addr = 0x081E_734C
+action = { kind = "count", label = "72F0轮询DSP忙" }
+
+[[patch]]
+addr = 0x081E_7372
+action = { kind = "count", label = "72F0出DSP轮询" }
+
+[[patch]]
+addr = 0x081E_73B6
+action = { kind = "count", label = "72F0轮询A10003F6" }
+
+[[patch]]
+addr = 0x081E_73D2
+action = { kind = "count", label = "72F0发消息1" }
+
+[[patch]]
+addr = 0x081E_73FC
+action = { kind = "count", label = "72F0走到尾" }
+
+[[patch]]
+addr = 0x0831_2020
+action = { kind = "count", label = "调312020" }
+
+[[patch]]
+addr = 0x0831_22C8
+action = { kind = "count", label = "调3122C8" }
+
+[[patch]]
+addr = 0x0826_744C
+action = { kind = "count", label = "调26744C" }
+
+# 下一个里程碑探针：C 参考日志（target/ref_boot.log）的路线图是
+#   SD mount ok → l1audio_sethandler ×5 → **dbg_print(cold reset)** → L1usim_Reset →
+#   ATR= 3B00 → SIM RESET OK → select 7F20 → IMEI/GPRS/license
+# 前两项现在已经达成（5 个注册点各响 1 次），全日志里 `dbg_print` 一条都没有 → 用这条判定
+# SIM 任务有没有走到冷复位。`SIM main` 已经响 2 次，所以任务是活的，堵在等消息上。
+[[patch]]
+addr = 0x0803_5732
+action = { kind = "count", label = "cold reset 打印点" }
+
+# ---------- 子代理报告 + 本人逐条复核后的两个判定点 ----------
+# (A) `cold reset` 那个处理函数 `0x0803_56F8` 在全镜像**没有任何 BL 调用点**，只以指针形式存在于
+#     ROM 组 `0x086FC9BC`（头 `0x000C0601`，槽 `+4 = 0x080356F9`、`+8 = 0x08035565`）。
+#     真正的进入点是 SIM 任务里的间接派发：
+#       0x0800C5DE ldrb r0,[r7,4] ; ldrb r1,[r6,4] ; r0 = 3*r0 + r1 ; r0 <<= 2
+#       0x0800C5E8 ldr r1,[=0xF01677CC] ; 0x0800C5EC ldr r2,[r1,r0] ; 0x0800C5F2 blx r2
+#     ⇒ 只要 RAM 回调表 0xF01677CC 没被填上，冷复位永远到不了。用 MT6252_WATCH 看有没有人写它，
+#     这条计数看派发点本身有没有被执行。
+[[patch]]
+addr = 0x0800_C5F2
+action = { kind = "count", label = "SIM回调派发blx" }
+
+# (B) 那 117 个无限等全是 Nucleus QUEUE 收信（`0x08312BEA: bl 0x081C7A1E`，r1=4 写进 tc_status，
+#     timeout 恒为 -1 ⇒ 内核根本不注册定时器，只能被 `TASK_Resume(,4)` 叫醒）。
+#     全 ROM 唯一的投递出口是 `0x0823F6CC(QUEUE_Send)`，它只有 4 个调用点：
+#       0x08013146 / 0x08013192 / **0x0802D39A** / **0x0823FE12**
+#     其中 0x0823FE04..12 是"按目标任务号查 `[0xF016B0A4]` 任务表、取 `+0x14` 的队列指针、
+#     投 16 字节、timeout=0"的路由。计数就知道**开机到现在到底有没有投递过消息**。
+[[patch]]
+addr = 0x0823_F6CC
+action = { kind = "count", label = "QUEUE_Send" }
+
+[[patch]]
+addr = 0x0802_D39A
+action = { kind = "count", label = "投递路由2" }
+
+[[patch]]
+addr = 0x0801_3146
+action = { kind = "count", label = "投递路由3" }
+
+[[patch]]
+addr = 0x0801_3192
+action = { kind = "count", label = "投递路由4" }
+
+# ---------- SIM 任务为什么进不到派发点（实测：`SIM回调派发blx` = 0，而 QUEUE_Send = 80）----------
+# SIM main `0x0800_CAC0` 的循环是 `bl 0x0801_479C`(收信) → `cmp r0,0x6A` → …；
+# 派发点在另一个函数 `0x0800_C438` 里（`0x0800_C5DE` 算索引 → `0x0800_C5F2 blx r2`）。
+# 这几条计数把"收了几次信 / 走到哪个分支 / 派发函数进没进"一次分开。
+[[patch]]
+addr = 0x0800_CAF2
+action = { kind = "count", label = "SIM收信调用" }
+
+# 修正：SIM main `0x0800_CAC0` 的**第一条指令序列里就在阻塞收信** ——
+#   0x0000CAD2 ldrb r0,[r4] ; r0 = 0x34*r0 + [0xF016B0A4] ; 0x0000CAE0 之前一句 ldr r0,[r0,#0x14]
+#   （= 自己的 QUEUE 指针，算法与投递路由 0x0823FE0E 完全一致）
+#   0x0000CAE0 bl 0x08239D58(r0=queue, r1=buf) → movs r3,1 → 0x081BF1EC mvns → **timeout = -1**
+# 所以任务停在**第一次**收信上，挂在 CAF2 的探针永远不响。
+[[patch]]
+addr = 0x0800_CAE0
+action = { kind = "count", label = "SIM第一次阻塞收信" }
+
+# 80 次投递到底是投给谁的：投递路由在 0x0823FDFC 取 `msg.dst_id`（ldrh [r4,#2]），
+# 再经 `[0xF015DD80 + dst_id]` 换算成任务槽。打这条就知道 SIM 槽位有没有被投递过。
+[[patch]]
+addr = 0x0823_FDFE
+action = { kind = "log_reg", reg = "r0", label = "投递dst_id" }
+
+# 发送者身份**打不到**：FDF2 的 `bl 0x081C_9370` 已经把 LR 覆盖成路由自己的返回地址
+# （实测 lr 恒为 0x0823FDF7）。要认发送方只能挂在这段被调函数的**入口之前**或读栈上保存的
+# 返回地址。这里只保留目标队列指针（r0），它已经足够判定"投给了哪个任务"。
+[[patch]]
+addr = 0x0823_FE12
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "发送目标队列与消息" }
+
+# 路由里的这段（0x0823FDCC..FDF0）读到底了，**它不是丢弃闸门**：
+#   r0 = (u16)[msg+0] = msg_id；bit = 1 << (msg_id & 0x1F)；word = [0x4000B344 + 4*(msg_id>>5)]
+#   位为 0 → 落到 0x0823FDE2；`msg_id == 0x6A` 直接 beq 进发送路径；否则只是 `bl 0x081D_51D8`
+#   记一笔（计数器常量 0x431+1），然后 **照样落进 0x0823FDF0 的发送路径**。
+# 实测：80 次全部发送成功，其中 7 次走了"位未置"分支，且这 7 次的 msg_id 全是 0x6A。
+[[patch]]
+addr = 0x0823_FDE2
+action = { kind = "count", label = "路由_位未置分支" }
+
+# 被走"位未置"分支那几条的 msg_id（FDE4 处 r0 还没被 FDE6 的 `ldr r0,[=0x431]` 覆盖）
+[[patch]]
+addr = 0x0823_FDE4
+action = { kind = "log_reg", reg = "r0", label = "位未置分支的msg_id" }
+
+[[patch]]
+addr = 0x0823_FDF0
+action = { kind = "count", label = "路由_进入发送" }
+
+[[patch]]
+addr = 0x0823_FDC8
+action = { kind = "count", label = "路由_dst_id越界" }
+
+# ---------- 冷复位 handler 的真正的派发者（SIM 接口驱动，经 ops 表间接进入）----------
+# `0x080D_0EC0` 静态没有 BL 调用者，但 ROM 里 `0x086F_A78C` 有它的地址 —— 而
+# `0x086F_A77C/80` 这一带正是 scatter 复制进 RAM `0xF016_1E0C`（槽表）的那块，
+# 所以它是**经表间接调用**的（再次说明"find_bl 报 0 调用者 ≠ 不可达"）。
+# 函数体：r3 → `bl 0x081A_2A24` 解析成槽号 r5（<4 否则 assert 0x10F）；
+#         `[0xF01F1470]==1` 时打印 "[SIM]:sim interface inversed!!" 并令 r5 = 1-r5；
+#         `[sp+8]`（第 5 个参数）为 0 → assert 0x11D；
+#         `0x080D_0EF8: r0 = [0xF016_1E0C]`，`r4 = [r0 + r5*4]` = 处理函数组表；
+#         `0x080D_0F1C: ldr r7,[r4]` → `0x080D_0F26: blx r7` ← **冷复位 entry[0] 就从这里进**
+[[patch]]
+addr = 0x080D_0EC0
+action = { kind = "count", label = "SIM接口派发器入口" }
+
+[[patch]]
+addr = 0x080D_0EF8
+action = { kind = "count", label = "SIM接口取槽表" }
+
+[[patch]]
+addr = 0x080D_0F1C
+action = { kind = "count", label = "SIM接口entry0解引用" }
+
+[[patch]]
+addr = 0x080D_0F26
+action = { kind = "log_pair", reg = "r7", reg2 = "r5", label = "SIM接口实际调用的handler" }
+
+# ---------- SIM 消息发送链（子代理报告 + 我逐条 r2 核实）----------
+# 消息头的 dst_id 只有一个落点：构造器 `0x081E_18A8` 的 `0x081E18EA: strh r4,[r0,2]`（r4 = 第 0 个参数）。
+# 构造器细节（已核实）：msg_id 取自全局 `[0xF021E900]`；`dst==1 → src 0x3C`、`dst==0x12 → src 0x3D`、
+# 其它 → 0x14；`msg_id==0x25 && dst==0x12` 时改投 `0x13`；随后 `bl 0x0823FE3A/0x0823FE32`。
+# 传 `movs r0,0x12` 的发送方共 6 处（全部 r2 核实存在）：
+[[patch]]
+addr = 0x081E_18A8
+action = { kind = "count", label = "SIM消息构造器" }
+
+[[patch]]
+addr = 0x080B_7BBC
+action = { kind = "count", label = "发送方1(0x080B7B6C)" }
+
+[[patch]]
+addr = 0x080E_93E8
+action = { kind = "count", label = "发送方2(0x080E93A8)" }
+
+[[patch]]
+addr = 0x0811_3CF2
+action = { kind = "count", label = "发送方3(0x08113C?)" }
+
+[[patch]]
+addr = 0x0813_001C
+action = { kind = "count", label = "发送方4(0x081300?)" }
+
+[[patch]]
+addr = 0x0821_2570
+action = { kind = "count", label = "发送方5(0x082125?)" }
+
+[[patch]]
+addr = 0x0826_00E8
+action = { kind = "count", label = "发送方6(0x082600?)" }
+
+# 这 6 个发送方的上一级入口（子代理给的，尚未核实 —— 计数若是 0 就说明断在这一层之上）
+[[patch]]
+addr = 0x0808_11A8
+action = { kind = "count", label = "上层入口A(未核实)" }
+
+[[patch]]
+addr = 0x0804_9844
+action = { kind = "count", label = "上层入口B(未核实)" }
+
+[[patch]]
+addr = 0x080E_99FE
+action = { kind = "count", label = "上层入口C(未核实)" }
+
+[[patch]]
+addr = 0x080E_9ADC
+action = { kind = "count", label = "上层入口D(未核实)" }
+
+# 另一条：派发器唯一调用点（ag_ops 报告，尚未核实），一起打就知道断链在哪条腿上
+[[patch]]
+addr = 0x0811_D754
+action = { kind = "count", label = "ops表唯一调用点(未核实)" }
+
+[[patch]]
+addr = 0x0800_CAFA
+action = { kind = "count", label = "SIM收信返回" }
+
+[[patch]]
+addr = 0x0800_C438
+action = { kind = "count", label = "SIM派发函数入口" }
+
+[[patch]]
+addr = 0x0800_C5DE
+action = { kind = "count", label = "SIM算索引" }
+
+# `SIM回调派发blx`（0x0800_C5F2）已在上面 (A) 组里挂过一次，不要重复挂：
+# 同地址第二个 hook 会让同一个计数加两遍。
+
+[[patch]]
+addr = 0x081A_00C8
+action = { kind = "count", label = "定时器移除" }
+
+# ---------- tick 到时钟的那一段（实测：整次开机 CTIRQ1 LISR 只响 1 次、时钟递增 0 次）----------
+# 链路：LISR `0x4000_82F8` → 跳板表 0x40009448 → 服务 `0x08018638`
+#   `0x0801863c: ldrb r0,[=0xF016C918,#0x18] ; cmp 0 ; beq 返回`   ← 开关量 [0xF016C930]
+#   `0x08018646: movs r0,1 ; movs r1,0 ; bl 0x081B4460`            ← 唯一进时钟的调用
+#   `0x081B446a: cmp r0,#1 ; bne 退出`
+#   `0x081B4484: blx 0x082881EC` → 0x4000A4D8 NU_Increment_Clock
+# 再加解屏蔽点 `0x08031266 INT_unmask(1)`。哪一段是 0，断点就在哪一段。
+[[patch]]
+addr = 0x0801_8638
+action = { kind = "count", label = "13MHz服务入口" }
+
+# 服务的第一句是 `ldrb r0,[=0xF016C918,#0x18] ; cmp 0 ; beq 返回`。
+# 实测这个开关量在开机早期是 0（所以那次唯一投进去的 CTIRQ1 原样返回了），
+# 由 0x0806_3648 写开之后就一直是 1 —— 问题已经定位完，这里只留计数：
+# `服务里调时钟` 比 `13MHz服务入口` 少 1，少的就是开关还没开的那一次。
+[[patch]]
+addr = 0x0801_8646
+action = { kind = "count", label = "服务里调时钟" }
+
+[[patch]]
+addr = 0x081B_4460
+action = { kind = "count", label = "时钟门入口" }
+
+[[patch]]
+addr = 0x081B_4484
+action = { kind = "count", label = "调递增时钟veneer" }
+
+[[patch]]
+addr = 0x0828_81EC
+action = { kind = "count", label = "veneer到NU_Increment" }
+
+[[patch]]
+addr = 0x0803_1266
+action = { kind = "count", label = "解CTIRQ1屏蔽" }
+
+[[patch]]
+addr = 0x0806_3648
+action = { kind = "count", label = "写13MHz服务开关" }
+
+# 入口的 r0 决定那道门读的是谁：0x4000AD3C（静态控制块）还是动态分配的 TCB。
+# 这条只在系统任务真被调度时才响，量极小，所以用打印而不是计数。
+[[patch]]
+addr = 0x0800_1A46
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "系统任务入口参数" }
+
+# ---------- 绘图原语到底有没有被调用（把"没画"再切一刀）----------
+# 实测 `[0x10280, +0x25800)` 一整轮全 0 ⇒ 没有像素落进 L0 显存。但"没落显存"还有两种成因：
+# 固件根本没请求画，或者**画了、被裁掉了 / 画到别的缓冲上**。这两者要做的下一步完全不同，
+# 所以给这几个原语各挂一条计数。注意它们**没有直接 BL 调用者**（只经按像素格式分派的函数指针表，
+# 表在 0x0852D2A0 起、由 0x0824_597C 装进 DC 的 +0x1C..+0x2C），所以静态"0 调用者"不等于"从没执行"。
+[[patch]]
+addr = 0x0825_6870
+action = { kind = "count", label = "画点原语A(取层基址)" }
+
+[[patch]]
+addr = 0x0825_6884
+action = { kind = "count", label = "画点原语B(显式层)" }
+
+[[patch]]
+addr = 0x0825_68AC
+action = { kind = "count", label = "矩形填色" }
+
+[[patch]]
+addr = 0x0825_6B56
+action = { kind = "count", label = "色键块搬移(贴图/字形)" }
+
+[[patch]]
+addr = 0x081F_FEDC
+action = { kind = "count", label = "GDI位图贴图入口" }
+
+# 真正"落盘"那一句：`blx r7` 走指针表。入口>0 而这里=0 ⇒ 在入口和落盘之间被弹回。
+[[patch]]
+addr = 0x0820_0034
+action = { kind = "count", label = "贴图经函数指针落盘" }
+
+# 越界闸门失败后的改道（`0x081FFF32` 拿 层+0x10 的右界比）：这里 >0 而"落盘"=0，就是**裁切吞掉了整幅画**。
+[[patch]]
+addr = 0x0820_0012
+action = { kind = "count", label = "贴图被裁切改道" }
+
+# `0xF023421C` 一族**不是** "GDI 嵌套/绘制深度"（那条来自子代理 E 的口径，已推翻）：
+# 结构是 `{u8 rd, u8 wr, u8 cnt, u8 max}` + 130(0x82)×16B 环（证据 `0x0800EC56: cmp r0,#0x82`、
+# `0x0800EC44: adds r2,#4`），`sub_0800EC30` 只是"从环里取一件"，`[0xF023421E]` 是环内条数。
+# 旧注释写"这个字节为 0 时主循环跳过全部处理与绘制"是**我猜的**，而且我把"进门 48 次"当成
+# "被拒 48 次"——那是"执行过 ≠ 分支走过"的老坑。现在两条臂各挂一条计数，用测的。
+[[patch]]
+addr = 0x0800_EC3A
+action = { kind = "count", label = "环取件-cnt为0直接返回" }
+
+[[patch]]
+addr = 0x0800_EC3E
+action = { kind = "count", label = "环取件-cnt非0往下取" }
+
+[[patch]]
+addr = 0x0800_EC30
+action = { kind = "count", label = "环取件门入口(读F023421E)" }
+
+# ---------- 抓"闪存状态重发环"到底在比什么 ----------
+# `0x086F28A6..0x086F28BA` 是一个**无上界**重发环：发一条命令 → 取数据窗口回读字的
+# bits[23:16] 当响应 → 与 `*([r7+0x2c])` 指向的掩码做 `tst`，非 0 就再发一遍。
+# 末端整轮都在这个环里（命令 0x05 反复重发），所以要的是**那三颗值**，不是猜。
+# 三条都用 `poke_from_reg` 写进 8 MB SDRAM 顶端一页（跑完会 dump 出来核对这页其它字节仍是 0，
+# 若不为 0 就说明这页被固件用了，本组数据作废）。
+[[patch]]
+addr = 0x086F_28F8
+action = { kind = "count", label = "闪存重发环③转圈" }
+
+[[patch]]
+addr = 0x086F_285A
+action = { kind = "count", label = "tst环A转圈" }
+
+[[patch]]
+addr = 0x086F_28A6
+action = { kind = "count", label = "tst环B转圈" }
+
+[[patch]]
+addr = 0x086F_27B0
+action = { kind = "count", label = "发一条闪存命令" }
+
+[[patch]]
+addr = 0x086F_30A8
+action = { kind = "count", label = "进触发自旋" }
+
+[[patch]]
+addr = 0x0000_038C
+action = { kind = "count", label = "RAM发一条闪存命令" }
+
+[[patch]]
+addr = 0x0000_0436
+action = { kind = "count", label = "RAMtst环A转圈" }
+
+[[patch]]
+addr = 0x0000_0482
+action = { kind = "count", label = "RAMtst环B转圈" }
+
+[[patch]]
+addr = 0x0000_04D4
+action = { kind = "count", label = "RAMcmd5重发环③转圈" }
+
+# 环A 的判据是 `tst 掩码, 响应` 非 0 就重发（掩码 = `*[[r5+0x80]+0x2c]`，响应 = 回读字 bits[23:16]）。
+# 这两颗值就是"要让这条闪存读结束，设备到底该答什么"的直接答案。
+[[patch]]
+addr = 0x0000_0468
+action = { kind = "count", label = "调用者0x468(=086F288C)" }
+
+[[patch]]
+addr = 0x0000_0514
+action = { kind = "count", label = "调用者0x514(=086F2938)" }
+
+[[patch]]
+addr = 0x0000_0692
+action = { kind = "count", label = "调用者0x692(=086F2AB6)" }
+
+[[patch]]
+addr = 0x0000_06D4
+action = { kind = "count", label = "调用者0x6D4(=086F2AF8)" }
+
+[[patch]]
+addr = 0x0000_070E
+action = { kind = "count", label = "调用者0x70E(=086F2B32)" }
+
+[[patch]]
+addr = 0x0000_071C
+action = { kind = "count", label = "调用者0x71C(=086F2B40)" }
+
+[[patch]]
+addr = 0x0000_085E
+action = { kind = "count", label = "调用者0x85E(=086F2C82)" }
+
+# 活着的调用者是 RAM 副本里的 `sub_086F2B12`(RAM 0x6EE)：它连发两条命令（0x70E 与 0x71C，各 8527 次，
+# 正好对上半数），然后把**第一条的响应** `r6` 与 `[[obj+0x80]+0x2c]` 指向的**掩码字节 0** 做 `tst`，
+# 非 0 就 `bne 0x77e` 走另一条路。所以这一对值就是"设备该答什么"的直接答案，每圈打一行（共 ~8.5k 行）。
+[[patch]]
+addr = 0x0000_072E
+action = { kind = "log_pair", reg = "r0", reg2 = "r6", label = "闪存掩码/响应" }
+
+[[patch]]
+addr = 0x0000_077E
+action = { kind = "count", label = "掩码命中后走的分支0x77E" }
+
+[[patch]]
+addr = 0x0000_0732
+action = { kind = "count", label = "掩码未命中继续0x732" }
+
+# ---------- ops 表 5 个入口 + 各内部重试头（都在 RAM 副本上，delta=0x086F2424）----------
+# 末端 19713 个 op 是"哪个入口"在跑、以及"哪条回边"在转，只能同深度一起数才分得开。
+# `poke_from_reg r0` 抓的是重试判据那一圈实际拿到的返回码（-121 / 0 / -1 三者决定它转不转）。
+[[patch]]
+addr = 0x0000_06EE
+action = { kind = "count", label = "ops入口-状态轮询0x6EE" }
+
+[[patch]]
+addr = 0x0000_084A
+action = { kind = "count", label = "ops入口-0x84A" }
+
+[[patch]]
+addr = 0x0000_0928
+action = { kind = "count", label = "ops入口-0x928" }
+
+[[patch]]
+addr = 0x0000_0A64
+action = { kind = "count", label = "ops入口-0xA64" }
+
+[[patch]]
+addr = 0x0000_0FC0
+action = { kind = "count", label = "ops入口-0xFC0" }
+
+[[patch]]
+addr = 0x0000_0956
+action = { kind = "count", label = "重试头0x956(等-121)" }
+
+[[patch]]
+addr = 0x0000_09E6
+action = { kind = "count", label = "重试头0x9E6(等0)" }
+
+[[patch]]
+addr = 0x0000_0AE6
+action = { kind = "count", label = "重试头0xAE6" }
+
+[[patch]]
+addr = 0x0000_08D2
+action = { kind = "count", label = "页尾校验通过" }
+
+[[patch]]
+addr = 0x0000_08D6
+action = { kind = "count", label = "页尾校验失败" }
+
+[[patch]]
+addr = 0x0800_A0BC
+action = { kind = "log_reg", reg = "r0", label = "环取出的消息id" }
+
+# 【实测更正】这条**不是**"MMI 收到的消息清单"：挂在 `0x0800A01A` 时 r0 = `[sp,#0x10]`，
+# 而 `sub_81A7BA0` 只在返回 1 时才写这个槽 ⇒ 实测 r0 只会是 `0x0/0x1`（9 次全这样），
+# 于是 `[r0+6]` 读到的是向量页 0x0/0x1+6 = 恒 0。**留着当哨兵可以，别拿它的 0 当结论。**
+[[patch]]
+addr = 0x0800_A01A
+action = { kind = "log_at", reg = "r0", offset = 6, size = 2, label = "收信槽哨兵(不是消息)" }
+
+# 真正该读的地方是**投递本地消息的 API** 入口：`0x0823FCA8(r0 = 消息结构)`。
+# 依据（同函数里现成可见的字段映射）：`0x0800A044..A052` 把 `[sp,#0x1c]→[msg+0]`、
+# `[sp,#0x1e]→[msg+2]`、`[sp,#0x20]→[msg+4]`、`[sp,#0x22]→[msg+6]`，而排空端
+# `0x0800A0BA/A0C8 ldrh r0,[r3,#0x22]` 拿它比 `0xB59/0x3328` ⇒ **+6 就是消息 id**。
+[[patch]]
+addr = 0x0823_FCA8
+action = { kind = "log_at", reg = "r0", offset = 6, size = 2, label = "投递的消息id" }
+
+[sim_stub]
+# ---------- 虚拟 SIM 卡：补"没人按下发送键"这一步 ----------
+# 实测到位的墙：SIM/SIM_2 都卡在**第一次**阻塞收信（timeout = −1，永不自愈），而投递机制本身是
+# 好的（一次开机 80 次投递，dst_id 分布里没有 SIM 的 0x12 / SIM_2 的 0x13）。该发消息的那个
+# 按 local id 派发的服务模块（`0x0804_92xx` 一族）从头到尾没被调用过。
+# 做法是"调固件自己的函数"，不伪造队列内容、不伪造寄存器、不跳进函数中段。
+# 方案 1（`0x081E_18A8` 消息构造器）已经试过并证明到顶：机制通（`QUEUE_Send` 80→81、
+# 出现 `投递dst_id(0x12)`、`SIM第一次阻塞收信` 2→3，任务确实被叫醒），但醒后落到
+# `0x0800CB18: bl 0x0801_4668`，那个分发器还要 `msg[+6]==1`、`msg[+0x151]==1`、
+# `msg[+0x2C5]==0` 加一次长度校验 —— 构造器入参凑不出这张上下文。
+# 顺带纠正一条我之前的错判：`SIM main` 里 `cmp r0,0x6A / beq 0x0800CB08` **不是**复位判据，
+# 不相等的分支只是先调一次 `0x0823FCA8`，之后**落到同一个 0x0800CB08**。别再拿 0x6A 当依据。
+enable = false
+# 注入窗口是量出来的（基线 `dump/run_attr.log`）：L1AUDIO 的 5 个注册在**片 ≤2360** 已完成，
+# 固件 park 发生在片 4000 之前，而 park 之后 `ctx_stack` 永远非空（固件是在 ISR 上下文里
+# 走进"无任务"死循环的）⇒ 只能投在 2400~park 之间。不安静时代码会自动逐片顺延。
+after_slices = 2500
+# 方案 2：直接调 SIM 接口派发器。它自己会 `[[0xF0161E0C]+slot*4] → entry[0] = 0x0803_56F9`。
+# 入参约定（逐条 r2 核实过 `0x080D_0EC0` 体内）：
+#   r3 = 槽号键，由 `bl 0x081A_2A24` 按 `0x0851_C584` 的两项配置解析成槽 0/1；≥4 会 assert 0x10F
+#   r1 必须非 0（`0x080D_0EEA: ldr r0,[sp,#8]` 在 `push{r0-r7,lr}; sub sp,4` 之后取的就是保存的 r1）
+#   r0/r1/r2 会原样转交给冷复位 handler（`0x080D_0F22: add r0,sp,4 ; ldm r0,{r0,r1,r2}`）
+func = 0x080D_0EC0
+arg0 = 0x00
+arg1 = 0x01
+arg2 = 0x00
+arg3 = 0x00
+# 走"消息构造器"那条路时才用得上这两个（现在不用，见上面的 msg[+0x151] 那串上下文）
+msg_id_slot = 0x0000_0000
+msg_id = 0x00
+# 实测上一版就是卡在这道守卫上：片数到 4435 也没注入 —— 固件到点已 park 在关机 `b .`，
+# 之前 MSDC 完成回调占住的 callback_ctx 永远不会返回，"等安静"= 永不注入。
+require_quiet = false
+
+[l1]
+# L1D 驱动的请求挂起位图（固件自己的 RAM 变量，不是寄存器）。CPU 侧只有置位的
+# `orr`（flash 0x081CEECE），整份 ROM 没有清位代码 —— 真机由 L1 当总线主设备清。
+pending_mask = 0x4000_C828
+
+[keypad]
+# key_pad_comm_def->keypad[72]，0xFE 表示该位置没有按键
+matrix = [
+    0x12, 0x49, 0x0F, 0x1A, 0x15, 0xFE, 0xFE, 0xFE,
+    0x17, 0x10, 0x03, 0x02, 0x01, 0x11, 0xFE, 0xFE,
+    0xFE, 0x17, 0x1B, 0x06, 0x05, 0x04, 0x0E, 0xFE,
+    0xFE, 0xFE, 0x17, 0x7B, 0x09, 0x08, 0x07, 0x14,
+    0xFE, 0xFE, 0xFE, 0x17, 0x7C, 0x0B, 0x00, 0x0A,
+    0x16, 0xFE, 0xFE, 0xFE, 0x17, 0xFE, 0xFE, 0xFE,
+    0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x17, 0xFE, 0xFE,
+    0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x17, 0xFE,
+    0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x17,
+]
+
+# ---------- C 参考日志自报的调用点路线（它自己把地址打在括号里）----------
+# 逐个挂计数：按 C 的顺序看，第一个为 0 的点就是我们与 C 参考实现的分叉处。
+# 这批点都是至多执行一次的日志点，计数开销可忽略。
+[[patch]]
+addr = 0x0828EB0A
+action = { kind = "count", label = "C路线00" }
+
+[[patch]]
+addr = 0x0802FCA5
+action = { kind = "count", label = "C路线01" }
+
+[[patch]]
+addr = 0x0805C96D
+action = { kind = "count", label = "C路线02" }
+
+[[patch]]
+addr = 0x08058241
+action = { kind = "count", label = "C路线03" }
+
+[[patch]]
+addr = 0x08046691
+action = { kind = "count", label = "C路线04" }
+
+[[patch]]
+addr = 0x0808FB85
+action = { kind = "count", label = "C路线05" }
+
+[[patch]]
+addr = 0x0806426C
+action = { kind = "count", label = "C路线06" }
+
+[[patch]]
+addr = 0x08064336
+action = { kind = "count", label = "C路线07" }
+
+[[patch]]
+addr = 0x080F59F0
+action = { kind = "count", label = "C路线08" }
+
+[[patch]]
+addr = 0x080357C2
+action = { kind = "count", label = "C路线09" }
+
+[[patch]]
+addr = 0x080357E2
+action = { kind = "count", label = "C路线10" }
+
+[[patch]]
+addr = 0x08099CD2
+action = { kind = "count", label = "C路线11" }
+
+[[patch]]
+addr = 0x08086D74
+action = { kind = "count", label = "C路线12" }
+
+[[patch]]
+addr = 0x080D2F26
+action = { kind = "count", label = "C路线13" }
+
+[[patch]]
+addr = 0x080D2F4A
+action = { kind = "count", label = "C路线14" }
+
+[[patch]]
+addr = 0x080D3112
+action = { kind = "count", label = "C路线15" }
+
+[[patch]]
+addr = 0x080D320A
+action = { kind = "count", label = "C路线16" }
+
+[[patch]]
+addr = 0x080D3432
+action = { kind = "count", label = "C路线17" }
+
+[[patch]]
+addr = 0x0809C080
+action = { kind = "count", label = "C路线18" }
+
+[[patch]]
+addr = 0x08063D4C
+action = { kind = "count", label = "C路线19" }
+
+[[patch]]
+addr = 0x080872EE
+action = { kind = "count", label = "C路线20" }
+
+[[patch]]
+addr = 0x080BDF68
+action = { kind = "count", label = "C路线21" }
+
+[[patch]]
+addr = 0x080BDF86
+action = { kind = "count", label = "C路线22" }
+
+[[patch]]
+addr = 0x080BDFA6
+action = { kind = "count", label = "C路线23" }
+
+# 本批实际地址：
+
+# ---------- SIM 发送方的门（子代理 B 报告 + 我用 park 转储复核）----------
+# 已证实 `[0xF021E900] = 0x24`（卡型，合法值）、`[0xF021E904] = 0xF021E908`（非空）
+# ⇒ 子代理说的"缺卡型/缺通道基址"不成立。剩下的门只有一个：
+# 发送方 A/C 宿主共用的 `slot+0x440`（= `[*0xF021E904]+0x440`）**唯一写者**是
+# `0x080B_7290`，值取自**收到的消息** `msg[+0x12]`（`0x080B72AA: ldrh r0,[r0,#0x12]` →
+# `0x080B72AC: strh r0,[r2]`）。所以要追的是"带通道号的那条收信"有没有到过。
+[[patch]]
+addr = 0x080B_7290
+action = { kind = "count", label = "写slot+0x440(通道号)" }
+
+# 发送方 A 的宿主入口与它前面的门：入口响、门后的 bl 不响 ⇒ 被门挡住
+[[patch]]
+addr = 0x080B_7B6C
+action = { kind = "count", label = "发送方A宿主入口" }
+
+[[patch]]
+addr = 0x080B_7B80
+action = { kind = "count", label = "发送方A过门" }
+
+# ---------- 任务普查探针（由 tools/dump_task_table.py 生成）----------
+# 【保留但先当无效】已实测：表 +0x10 那个字段不是任务入口 —— 90 个桩在一次开机里
+# 全为 0，而真正的入口（如 `0x0800B9AC` = L1AUDIO main、`0x0800CAC0` = SIM main）探针会响。
+# 有效做法是先看 `TCB_Create` 的实参：下面三条在创建点把 r0..r3 一起打出来，
+# 用 L1AUDIO（main 已知 0x0800B9AC）认出哪个参数是入口，再重建普查表。
+[[patch]]
+addr = 0x0800_648E
+action = { kind = "log_pair", reg = "r1", reg2 = "r2", label = "创建参数12" }
+
+[[patch]]
+addr = 0x0800_648E
+action = { kind = "log_pair", reg = "r3", reg2 = "r4", label = "创建参数34" }
+
+[[patch]]
+addr = 0x0800_648E
+action = { kind = "log_pair", reg = "r5", reg2 = "r6", label = "创建参数56" }
+
+# ---------- 任务普查：每个任务的入口桩是否被调度过 ----------
+# 由 tools/dump_task_table.py 生成；计数为 0 的任务 = 从未被调度起来
+[[patch]]
+addr = 0x08009FA8
+action = { kind = "count", label = "起来.MMI" }
+
+[[patch]]
+addr = 0x0800A908
+action = { kind = "count", label = "起来.AUX" }
+
+[[patch]]
+addr = 0x0800AC3C
+action = { kind = "count", label = "起来.DRVBMT" }
+
+[[patch]]
+addr = 0x0800B170
+action = { kind = "count", label = "起来.CC" }
+
+[[patch]]
+addr = 0x0800B224
+action = { kind = "count", label = "起来.CISS" }
+
+[[patch]]
+addr = 0x0800B390
+action = { kind = "count", label = "起来.FMR" }
+
+[[patch]]
+addr = 0x0800B3F8
+action = { kind = "count", label = "起来.FMT" }
+
+[[patch]]
+addr = 0x0800B4CC
+action = { kind = "count", label = "起来.GDC" }
+
+[[patch]]
+addr = 0x0800B5B4
+action = { kind = "count", label = "起来.GDD" }
+
+[[patch]]
+addr = 0x0800B60C
+action = { kind = "count", label = "起来.DRVKBD" }
+
+[[patch]]
+addr = 0x0800B6C8
+action = { kind = "count", label = "起来.L1" }
+
+[[patch]]
+addr = 0x0800B890
+action = { kind = "count", label = "起来.L1_2" }
+
+[[patch]]
+addr = 0x0800B9AC
+action = { kind = "count", label = "起来.L1AUDIO" }
+
+[[patch]]
+addr = 0x0800BA00
+action = { kind = "count", label = "起来.L4" }
+
+[[patch]]
+addr = 0x0800BA90
+action = { kind = "count", label = "起来.LLC" }
+
+[[patch]]
+addr = 0x0800BAE4
+action = { kind = "count", label = "起来.CAMERA" }
+
+[[patch]]
+addr = 0x0800BB8C
+action = { kind = "count", label = "起来.MED" }
+
+[[patch]]
+addr = 0x0800BC7C
+action = { kind = "count", label = "起来.VIDEO" }
+
+[[patch]]
+addr = 0x0800BCFC
+action = { kind = "count", label = "起来.MM" }
+
+[[patch]]
+addr = 0x0800BD58
+action = { kind = "count", label = "起来.NVRAM" }
+
+[[patch]]
+addr = 0x0800BED0
+action = { kind = "count", label = "起来.RATCM" }
+
+[[patch]]
+addr = 0x0800BF64
+action = { kind = "count", label = "起来.RATDM" }
+
+[[patch]]
+addr = 0x0800C0D4
+action = { kind = "count", label = "起来.REASM" }
+
+[[patch]]
+addr = 0x0800C1F4
+action = { kind = "count", label = "起来.RR" }
+
+[[patch]]
+addr = 0x0800C380
+action = { kind = "count", label = "起来.RSVA" }
+
+[[patch]]
+addr = 0x0800CAC0
+action = { kind = "count", label = "起来.SIM" }
+
+[[patch]]
+addr = 0x0800CD38
+action = { kind = "count", label = "起来.SM" }
+
+[[patch]]
+addr = 0x0800CEB4
+action = { kind = "count", label = "起来.SMS" }
+
+[[patch]]
+addr = 0x0800D080
+action = { kind = "count", label = "起来.SNDCP" }
+
+[[patch]]
+addr = 0x0800D110
+action = { kind = "count", label = "起来.TR" }
+
+[[patch]]
+addr = 0x0800D468
+action = { kind = "count", label = "起来.TST" }
+
+[[patch]]
+addr = 0x0800D7F8
+action = { kind = "count", label = "起来.V2DEC" }
+
+[[patch]]
+addr = 0x0800D880
+action = { kind = "count", label = "起来.VFILE" }
+
+[[patch]]
+addr = 0x0800EB94
+action = { kind = "count", label = "起来.IDLER" }
+
+[[patch]]
+addr = 0x08010D60
+action = { kind = "count", label = "起来.ABM" }
+
+[[patch]]
+addr = 0x08011268
+action = { kind = "count", label = "起来.BT" }
+
+[[patch]]
+addr = 0x08012FD8
+action = { kind = "count", label = "起来.MMS" }
+
+[[patch]]
+addr = 0x0801370C
+action = { kind = "count", label = "起来.PPP" }
+
+[[patch]]
+addr = 0x08015090
+action = { kind = "count", label = "起来.SOC" }
+
+[[patch]]
+addr = 0x08015284
+action = { kind = "count", label = "起来.TCPIP" }
+
+[[patch]]
+addr = 0x08016010
+action = { kind = "count", label = "起来.USB" }
+
+[[patch]]
+addr = 0x0801778C
+action = { kind = "count", label = "起来.WAP" }
+
+[[patch]]
+addr = 0x08017954
+action = { kind = "count", label = "起来.WPS" }
+
+[[patch]]
+addr = 0x084C7130
+action = { kind = "count", label = "起来.MCARE" }
+
+# 共 44 个不同入口（45 个任务）
+
+# ── C 版 `hookCodeCallBack`（`MT6252_Simulator/src/main.c:1829-1928`）核对结论：已齐，不是差在哪 ──
+# 起因：`docs/img/01.png`/`03.png` 证明 C 版跑同一份固件能出完整 UI，而 Rust 版 L0 全黑，
+# 于是去核对 C 版那张"命中就硬改寄存器/内存"的 switch。结论是**九处改状态的地址里有八处本画像
+# 早就做了**（`0x0837_0220` R0=1 开机流程全部完成、`0x083D_1C28` 清 `[0xF0166068]`、
+# `0x0838_90C8` R0=1、`0x080E_7482` R2=R0、`0x0809_3FB2` R0=1、`0x080D_2CA4` `[R5+3]=0xff`、
+# `0x0822_3F66` R0=0、`0x0800_DA28` R0=0，都在本文件靠前处），所以"出图靠 C 版硬改返回值"这条
+# 假设**已被实测否掉**：这些旁路全开着，画面仍然是黑的。差的东西在别处（下一步：抓 C 版自己的
+# 固件日志做叙事差分 —— 我这边一整跑只有 3 条 `kal_debug_print`/`dbg_print`，C 版有一长串）。
+# 唯一没做的一处是 `0x0806_01AC`/`0x0806_01EC`（C 版往 `TMDA_BASE` 写 R0，注释"暂时去不掉"）。
+# 它对应 `sub_08060194`：`r4=0x41<<0x19=0x8200_0000`，目标值 `([0x8200000C]+2)&0xffff`，然后
+# `while([0x82000000]!=目标)` 空等 —— 就是"等 13MHz 计数器走 2 格"。C 版必须作弊是因为**它的**
+# 计数器不推进；Rust 版推进，所以不需要。实测也印证：`0x0806_01AC` 在 4436 片里命中 4889 次
+# ≈ 每片 1 次，而真卡死会是每片约 3750 次（那条循环体 4 条指令 / 每片 15000 条）。
+#
+# 顺手记一条自测教训：上面那八处"没做"的错判，是因为我拿 `08370220` 去 grep，而画像写的是
+# `0x0837_0220`（分组下划线）。**在这个画像里搜地址必须把下划线算进模式**，否则又会造出一批
+# "某处没实现"的假缺口。
+
+# ── C 版开机叙事里"我缺的第一批里程碑"（对照 `target/ref_boot.log` 的调用点）──
+# 这三个点**早就有计数了**，就是 `C路线09`(`0x0803_57C2`)、`C路线10`(`0x0803_57E2`)、
+# `C路线12`(`0x0808_6D74`)。实测（`run_paint2.log`、`run_lisr2.log` 两次独立跑法一致）：
+# `C路线00/06/07/08` 各 1 次，而 `09/10/12` **一次都没有** —— 也就是固件从没读到 ATR、
+# 从没打出 `L1usim_Reset OK` / `SIM RESET OK`。别再在这儿加同地址探针（同地址会互吞，
+# 恒 0 长得和"没走到"一模一样）。
+# 地址核对过：括号里 C 版日志行尾那个值就是 `bl 0x819f5b4`(`kal_debug_print`) 那条指令本身，
+# 不是"调用点 ±4"，按 ±4 猜就是一个恒 0 的假阴性。
+
+# 中断到底有没有派发到卡的那段代码：`0x0800_2E38` 是 LISR 派发器（算 `index=[INT_STATUS]&0x3F`），
+# `0x080F_5EB0` 是 USIM 的 LISR 入口 —— 它是从运行时 LISR 表（`0x4000C840`，每项 12 字节
+# `{物理号, 例程, 名字指针}`）的**槽 5** 读出来的，名字指针 `0x08099F90` 就是字符串 "USIM_Lisr"。
+# 表里存的是 `0x080F5EB1`（Thumb 位在内），清掉低位才是真正入口。
+# 两个计数一起看，就能分清"派发器没跑"和"派发到别处去了"。
+# 实测（`run_lisr2.log`，片 4856）：派发器 2806 次、CTIRQ1 LISR 2804 次、**USIM_Lisr 0 次**，
+# 而同一次跑里 SIM 的中断确实投出去了（`投线4 → 已投递 片=2780`）。
+[[patch]]
+addr = 0x0800_2E38
+action = { kind = "count", label = "LISR派发器入口" }
+
+[[patch]]
+addr = 0x080F_5EB0
+action = { kind = "count", label = "USIM_Lisr 入口" }
+
+# ── GDI 前端总闸：`[0xF016AD1C]` 是不是非 0 ──
+# `sub_0824786C` 有 **211 个直接调用者**（`find_bl` 实测），覆盖全部 GDI/GRL 前端，结构是
+#   0x0824786E ldr r0,[0x82479ac]=0xF016AD1C ; ldrb r0,[r0] ; cmp r0,#0
+#   0x08247874 bne 0x082478DE   ← **闩锁非 0：直接 pop 返回，一次 acquire 都不做**
+#   0x08247876 bl 0x81E6ABC     ← 闩锁为 0 才会走到这里
+# 隔壁 `sub_082478E0` 同构（非 0 就 `return 0`）。所以这面旗一旦非 0，**整个 GDI 前端静默空转**，
+# 症状正好是"绘制原语一次没进、显存零写入"。
+# ⚠ 这条旗早前被我列进"已排除的关机闩锁"，那是**没查过它管着多少调用点**就下的结论。
+# 两个计数一比就分清：入口 > 0 而 acquire = 0 ⇒ 闩锁非 0，GDI 被整体关掉。
+# 值本身用 `MT6252_DUMP=0xF016AD1C:4` 直接读。
+[[patch]]
+addr = 0x0824_786C
+action = { kind = "count", label = "GDI前端总闸入口(211调用者)" }
+
+[[patch]]
+addr = 0x0824_7876
+action = { kind = "count", label = "总闸:闩锁为0真去acquire" }
+
+# 代理报的另外两个"该断的地方"：DC 安装器（要求 `DC+4` bit0==1，否则 assert 0x54A）
+# 和 GRL 函数表 `0x0852D278` 行 7 的"取槽即调"站点。
+[[patch]]
+addr = 0x0824_597C
+action = { kind = "count", label = "DC安装器入口" }
+
+[[patch]]
+addr = 0x0834_3490
+action = { kind = "count", label = "GRL表:取槽即调(行7)" }
+
+# ── 断点已夹到"DC 装好"与"有人调光栅"之间，这三条分清是哪一半 ──
+# 实测：GDI 前端总闸入口 294 次、真去 acquire 也 294 次、`[0xF016AD1C]=0` ⇒ **前端没被关**；
+# DC 安装器 `sub_0824597C` 跑了 2 次；而 `grl_blt`(`0x081FFEDC`) 与 GRL 表调用点 0 次。
+# `sub_0824597C` 的体内结构（反汇编核过）：
+#   0x08245980 bl 0x824786C            ; 走总闸
+#   0x08245992 str r5,[0xF01D5F18,#0x18] ; 存 DC 指针
+#   0x0824599E ldr r0,[r5,#4] ; lsls r0,#0x1f ; bne 0x82459AC  ; **DC+4 bit0 必须为 1**
+#   0x082459AC.. 起：从 GRL 表 `0x0852D278` 逐行取函数指针装进 DC 的 +0x1C/+0x20/…
+# 所以 `过了DC+4判据` 若等于安装器入口数，说明 DC 装完整了，问题在"没人发起绘制"。
+[[patch]]
+addr = 0x0824_59AC
+action = { kind = "count", label = "DC安装器:过了DC+4判据" }
+
+# `grl_blt` 全 ROM 只有两个直接调用点，各挂一条，看是"没人调 blit"还是"调了但在判据前返回"
+[[patch]]
+addr = 0x082F_45E0
+action = { kind = "count", label = "grl_blt调用者甲(面积门)" }
+
+[[patch]]
+addr = 0x0817_ED54
+action = { kind = "count", label = "grl_blt调用者乙" }
+
+# 开机动画 → 待机屏：把"worker 全报到"这条链的每一跳都钉住
+# 实测第一帧已出（开机动画泡泡帧，片 4000→5000 有 24.8% 字节在变 ⇒ 动画在播，不是冻住）。
+#
+# 【修正一处假零】原来那条 `动画完成:解阻塞task0x283A` 打在 `0x08385A50`，而反汇编显示
+# `0x08385A50` 是 `[r4,#8] **!= 0**` 那一条分支；真正的解阻塞是
+#   0x08385A48  bl 0x0829A5E8   (r0=0x283A, r1=sub_08352940(5), r2=0x93)
+# 它在 `[r4,#8] == 0` 分支上。也就是说：只要固件走的是"正常"那条路，旧探针**必然**读 0。
+# 现在两条分支各钉一个计数。
+#
+# 【回调开头还有一道提前返回闸】完整读过的控制流（`sub_08385A1C`，r4 = r0 = 描述符指针）：
+#   0x08385A22  movs r0,0xff ; bl 0x08385AC4      ←  setter，见下
+#   0x08385A26  bl 0x08390854                     ←  忙判定
+#   0x08385A2A  cmp r0,#0 ; beq 0x08385A34(走尾)   ←  非 0 就**提前返回**：0x08385A2E bl 0x0836C6F4 + pop
+#   `sub_08390854` 体：`r0 = (sub_08243DB8()!=0 && sub_08389094()!=0) ? 1 : 0`
+#   0x08385A34  ldrb r0,[r4,#8] ; cmp r0,#0 ; bne 0x08385A4E
+#   0x08385A48  bl 0x0829A5E8(0x283A, …, 0x93)     ←  真解阻塞
+#
+# 【2026-09-26 子代理逐字节复核，更正我先前写反的两处前提】
+#   (a) `sub_083890A0` 第一条是 `0a 49 ldr r1,[pc,#0x28]` → **r1 自己取 0xF01658B2**，不是"继承调用者的垃圾"。
+#       （我当时 r2 反汇编流从 0x0838909C 的字面量池上错位起步，把 `b2 58` 解成了 `ldr r2,[r6,r2]`，
+#        于是漏看了这条，才误判成"参数没备料"。）
+#   (b) `sub_08390854` 的**极性是"两个子判据都为 0 才返回 1"**，不是我先前写的"都非 0"：
+#         r4 = (sub_08243DB8()==0)   r1 = (sub_08389094()==0)   返回 (r4 && r1)
+#       配 `0x08385A2C beq 0x08385A34`（r0==0 才走尾解阻塞）⇒
+#       **走尾的条件 = `[0xF01658B2]` 的 bit1==1 或 `[0xF01658B4]`!=0**。
+#   `sub_08243DB8()` 实测测的是 `[0xF01658B2]` 的 **bit1**（掩码 0x0002；r0=1→bit1，r0=7→bit2，其它→assert 0x1F3）。
+#   实测 dump（`dump/f01658ac_18*.bin`，四份全等）：`[0xF01658B2].u16 = 1` ⇒ bit1=0；`[0xF01658B4] = 3` ≠ 0。
+#   ⇒ **判据返回 0，回调确实走尾去解阻塞 task 0x283A**。这条链不是墙；下一轮探针要看它醒来之后。
+#
+# `sub_08385AC4(r0)` 是 **0xF031DEA4 状态字段的 setter**（反汇编核实）：
+#   strh r0,[0xF031DEA4] ；r0==1 → `strb 4,[0xF01655B6+4]`＝写 **[0xF01655BA]**；r0==0xff → 写 8
+# 实测该字段 = 0x0001（不是 0xff）⇒ 有人以 1 调它。在 setter 入口钉一条 print，
+# 一次就能看清"谁在什么时候把它写成几"。
+#
+# 【更正：+8 既有读者也有清零者，我先前"找不到任何读者"是错的】
+# 第二个代理只按字面量找，读点其实走**逃逸指针**：`sub_0837B958` 在栈上现搭 40 字节描述符，
+#   desc+0x20 = 0x08385A1D（完成回调，池 0x0837BA24 实测原字节 `1d 5a 38 08`）
+#   desc+0x24 = **0xF031DEA4**（上下文，0x0837B9F4 `0d 94 str r4,[sp,#0x34]`）
+# 再 `bl 0x08385650` 分配 588 字节（实测 `93 20 / 80 00` = `movs r0,0x93; lsls r0,#2`）+ memcpy 0x28。
+# 所以 `sub_08385A1C` 的 r4 **就是** 0xF031DEA4 那块，`0x08385A34 ldrb r0,[r4,#8]` 就是唯一的 +8 读点。
+# 写方有两条：`0x0837020E strb 1`（置）与 **`0x0837B9A2 strb r6(=0),[r4,#8]`（清）** —— 后者推翻了
+# "`sub_083701E0` 是唯一写者"。
+#
+# 【`sub_083701E0` 的来路：它没有 BL 调用者，只被开机进度引擎按表调用】
+# 主表 @0x086E1288 十条 `{u32 模块id, u32 handler, u32 子描述符}`，实测：
+#   {2,...,0x086E1318} {6,0x083637CD,0} {7,...} {8,...} {9,0x0836373D,0}
+#   **{0xA, 0x083647B9, 0x086E134C}** {0xE,...} {0x10,...} {0x11,0x08363865,0} {0x12,...}
+# 子描述符 @0x086E134C 实测 = `{records 0x086E1328, count 3, predicate **0x083701E1**}`，
+# 三条记录 = {0xB:0x0837B62D, **0xC:0x0837B959**, 0xD:0x0837B909}，而 0xC 那条的 handler 正是
+# 上面写 0xF031DEA4 块的那个人。⇒ 这条 predicate 问的是"模块 0xA 的 3 个 worker 报到齐了没"。
+# 它的 `sub_0837C8CC(D, 12)` 也已读通：D = `{+8 记录数组, +0C 条数, +0x1C+i 每条标志字节}`，
+# 查的是 id 0xC 那条的标志字节；`r1` 结构 = `{+0 D*, +4 i16 游标 A, +6 i16 总数 B}`。
+# ⇒ **置 1 有两条路**：(a) A==B；(b) A==B-1 且剩那条(id 0xC)标志为 0。
+# 仍待实测：谁写 A/B（静态没定到，代理已诚实标为未排除）。
+[[patch]]
+addr = 0x0837_01E0
+action = { kind = "count", label = "worker报到检查:入口" }
+
+# `r4 = r1` 在 `0x083701E2` 这一条里才完成，所以要看句柄得打在**下一条**。
+# 想知道"报到"到底是对哪个结构体做的、以及是谁调的（lr），这两个值一出来就能定死。
+[[patch]]
+addr = 0x0837_01E4
+action = { kind = "log_pair", reg = "r4", reg2 = "lr", label = "worker报到:句柄r4与返回地址" }
+
+# `sub_083701E0` 的两条判据分开数：r4 = 第二参数 r1，字段是 i16。
+#   0x083701F2 cmp [r4+4], ([r4+6]-1) ; bne 0x08370202   → 进了就调 0x0837C8CC([r4], 12)
+#   0x0837020C cmp [r4+4], [r4+6]     ; bne 0x08370210   → 相等才落进 0x0837020E 置 1
+[[patch]]
+addr = 0x0837_01F6
+action = { kind = "count", label = "worker报到:差一判据命中(去调0837C8CC)" }
+
+[[patch]]
+addr = 0x0837_0202
+action = { kind = "count", label = "worker报到:差一判据未命中" }
+
+[[patch]]
+addr = 0x0837_0200
+action = { kind = "log_reg", reg = "r0", label = "worker报到:0837C8CC返回" }
+
+[[patch]]
+addr = 0x0837_020E
+action = { kind = "count", label = "worker报到检查:置other_workers_ok" }
+
+[[patch]]
+addr = 0x0838_5AC4
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "DEA4状态setter写入值与返回地址" }
+
+[[patch]]
+addr = 0x0838_5A1C
+action = { kind = "count", label = "动画完成回调入口" }
+
+[[patch]]
+addr = 0x0838_5A2A
+action = { kind = "log_reg", reg = "r0", label = "动画完成:忙判定值(非0则提前返回)" }
+
+[[patch]]
+addr = 0x0838_5A2E
+action = { kind = "count", label = "动画完成:提前返回(忙)" }
+
+[[patch]]
+# 钩子在指令**之前**触发，所以要打在 `ldrb r0,[r4,#8]` 的**下一条**上才读得到值。
+addr = 0x0838_5A38
+action = { kind = "log_reg", reg = "r0", label = "动画完成:走尾时r4加8的字节" }
+
+[[patch]]
+addr = 0x0838_5A48
+action = { kind = "count", label = "动画完成:发offer那条bl" }
+
+[[patch]]
+addr = 0x0838_5A4E
+action = { kind = "count", label = "动画完成:尾但flag非0(走08390A80)" }
+
+# ── C 版有、我画像里原本没有的第 10 处硬改：`sub_08060194`（`L1D_WIN_Init_SetCommonEvent`）──
+# C 版 `main.c:1911-1915` 在 `0x80601AC` 与 `0x80601EC` 各挂一个钩，每圈做一次
+# `uc_mem_write(0x82000000, r0, 4)`，注释写"暂时去不掉"。反汇编核实它为什么需要：
+#   r4 = 0x41<<0x19 = **0x8200_0000**（TDMA 窗口本体）
+#   0x080601a0  r0 = (h[0x8200000C] + 2) & 0xffff     ← 不写 h[0x82000000]，只算出目标值
+#   0x080601a6  while (h[0x82000000] == r0) ;          ← 等对侧改开
+#   0x080601ac  while (h[0x82000000] != r0) ;          ← 再等对侧改成 r0
+# 真实芯片上是 L1/C2K 侧回写这个"公共事件"字。我的 C1XX 模型让 `TDMA_FRAME` **每读一次 +1**
+# （`src/devices/c1xx.rs:64`），所以两个圈理论上都会在 ≤65536 圈内自己退出去 —— 也就是说
+# **大概不需要** C 版那处硬改。但这只是推断，钉三条计数把它变成实测：入口 / 两条出口。
+[[patch]]
+addr = 0x0806_0194
+action = { kind = "count", label = "L1D公共事件:入口" }
+
+[[patch]]
+addr = 0x0806_01B2
+action = { kind = "count", label = "L1D公共事件:过了两圈(r0非0路)" }
+
+[[patch]]
+addr = 0x0806_01F0
+action = { kind = "count", label = "L1D公共事件:过了两圈(r0为0路)" }
+
+# 动画帧驱动（子代理说它靠 `bl 0x836C068` 的 tick 与 125/184 一类阈值比）
+[[patch]]
+addr = 0x0837_0240
+action = { kind = "count", label = "动画帧驱动入口" }
+
+# ── 解阻塞 API 本体 `sub_0829A5E8(r0=对象 id, r1, r2)` ──
+# 【更正：0x283A 不是任务 local id】两份任务表（0x0850EE40 条目 0x18、0x08510270 条目 0x1C）里
+# local id 全在 0x00..0xFF，而整段表区搜 `3A 28` **0 命中**；0x283A 属于一个 id 枚举带
+# （邻居 0x2839/0x283B/0x283C/0x2842/0x2843…，且 `0x2842=0x283A+8`、`0x2843=0x283A+9`），
+# 对象由 `sub_08385FF4` 分配 132 字节创建，代码带是
+# `plutommi/mtkapp/3rdapp/bingotheme/adaptation/Src/bingotheme_if.c`（串 @0x0851AF74，已读到原文）。
+# ⇒ 这条链在**主题 / backstage 待机 widget** 那一侧，不在内核任务侧。以下标签里的 "task" 全部按"对象"读。
+#
+# 反汇编核实（它内部还引用 **0xF031DEBA** —— 和动画描述符 0xF031DEA4 同一块，偏移 +0x16）：
+#   0x0829a5ea 214c  ldr r4,[=0xF031DEBA]     ; 池实测原字节 ba de 31 f0
+#   0x0829a5f2 bl 0x08249710                  ; 取"当前 id"
+#   0x0829a5f6 a842  cmp r0,r5 ; bne 0x0829a610   ; 当前≠目标 → 走公共路径 store+offer
+#   0x0829a610 2580  strh r5,[r4]             ; [0xF031DEBA] = 0x283A   ← **运行时可直接验证**
+#   0x0829a612 a780  strh r7,[r4,#4] ; 0x0829a614 6680 strh r6,[r4,#2]
+#   0x0829a63e bl 0x08354449(0x283A, 0x2842)  ; ★ 真 offer #1
+#   0x0829a669 bl 0x08354449(0x283A, 0x2843)  ; ★ 真 offer #2
+# **参数约定（子代理核到内核、我复核了池与常量）**：`r1`/`r2` 不参与唤醒，只被记进
+# `0xF031DEBC`/`0xF031DEBE`；`sub_08354449(module,index)` 组 key `(module<<16)|index` 后
+# → `sub_082F0761` → 按 key 在 `0xF022BBD4` 链表里找对象 → `sub_08299A8D` 走 TCB 状态写那一族。
+# 并且它**幂等**：`当前id==0x283A && 另一id==0x2843 && [DEBC]==r1 && [DEBE]==r2` 四条件齐 ⇒ 直接返回，
+# 一次 offer 都不发（历史上最容易把"探针没命中"误读成"没跑"的地方）。
+# `sub_08352940(5)` 也已核实是查表：表在 **0x08689520**、17 行 × 16 字节，键 5 那行实测
+# `05 00 00 00 2f 00 00 00 d0 07 00 00 12 10 00 00` ⇒ **恒返回常量 0x2F**（+8 那列 0x7D0=2000 是超时 tick）。
+[[patch]]
+addr = 0x0829_A5E8
+action = { kind = "count", label = "offer API:入口" }
+
+[[patch]]
+addr = 0x0829_A5F2
+action = { kind = "log_pair", reg = "r5", reg2 = "r7", label = "offer API:对象id与事件码" }
+
+[[patch]]
+addr = 0x0829_A610
+action = { kind = "count", label = "offer API:走store+offer公共路径" }
+
+# ── 开机总闸：`sub_0832CC3C`（处理 msg 0x2903）──
+# 反汇编核实（条件码方向也核过）：
+#   0x0832cc40 ldrh r0,[r5] ; cmp r0,#0x2903 ; 不等 → assert 0x2903
+#   0x0832cc50 29 4c  ldr r4,[=0xF030FC04]  ← 池在 0x0832ccf8，实测原始字节 04 fc 30 f0
+#   0x0832cc52 ldrb r0,[r4,#0xc] ; cmp #0 ; **beq 0x0832ccf0 = 丢弃**
+#   0x0832cc58 ldrb r1,[r5,#8] ; ldrb r0,[r4,#0xd] ; cmp r1,r0 ; **bne 0x0832ccf0 = 丢弃**
+#   0x0832cc60 … 继续处理
+# 【更正一处我自己写错的地址】基址是 0xF030FC04，所以 `+#0xc` = **0xF030FC10**、`+#0xd` = **0xF030FC11**，
+# 不是早先注释里的 0xF030FC0C/0D。（好在 `MT6252_DUMP=0xF030FC04:0x18` 盖住了这两种口径。）
+# 四条计数一比就知道：是没收到 0x2903、还是收到了被 `[0xF030FC10]==0` 挡掉、
+# 还是被 `[msg+8] != [0xF030FC11]` 挡掉。
+[[patch]]
+addr = 0x0832_CC50
+action = { kind = "count", label = "开机总闸:收到0x2903" }
+
+[[patch]]
+addr = 0x0832_CC58
+action = { kind = "count", label = "开机总闸:FC10非零已过" }
+
+[[patch]]
+addr = 0x0832_CC60
+action = { kind = "count", label = "开机总闸:消息被接受" }
+
+[[patch]]
+addr = 0x0832_CCF0
+action = { kind = "count", label = "开机总闸:丢弃" }
+
+# ── 谁该把总闸合上：`[0xF030FC10]=1` 的唯一非零写者是 `sub_0837BB00`（子代理找出、我逐字节核过）──
+#   0x0837bb00 feb5 push
+#   0x0837bb02 0f00 movs r7,r1     ; arg1 → 将写进 rec+0xd
+#   0x0837bb04 0400 movs r4,r0     ; **rec 是指针参数**，所以字面量扫描根本看不见这个写者
+#   0x0837bb0c 46f7d8fd bl 0x082c26c0
+#   0x0837bb10 0028   cmp r0,#0    ; ★ 唯一判据
+#   0x0837bb12 25d0   beq 0x0837bb60   ; ==0 → 一个字节都不写，返回 0
+#   0x0837bb1c 21 73  strb r1,[r4,#0xc]  = **[0xF030FC10]=1**  ← 核过原始字节
+#   0x0837bb20 67 73  strb r7,[r4,#0xd]  =  [0xF030FC11]=arg1
+# `sub_0837BB00` 全 ROM 只有一个调用者 `0x083704FC`，它在 `sub_083704B8`（rec 由参数传入）里：
+#   0x083704ca..0x083704d0  先把 rec+6/+8/+0xc/+0xd 全清 0
+#   0x083704d2 bl 0x0837fcd0 ; 0x083704d8 beq 0x083704e4   ; **[0xF02ED565]!=0 就走"终结"路**
+#   0x083704e6.. 循环 r4=0..1：bl 0x08352f38 → bl 0x0837fd04 → 为 0 才 bl 0x0837bb00
+# 判据 `sub_082C26C0`（核过：`ldrb r0,[r0,#1]`，基址 0xF02ED564 ⇒ 读的是 **`[0xF02ED565]`**）：
+#   `[0xF02ED565]!=0` → 走 0x082c26dc `movs r0,1` 返回 1
+#   否则 → 0x082c26e4 `ldrb r0,[r5,#1]`，r5 = `0xF029EEA4 + 8*idx`，看**当前任务的 state 字节**
+# 于是"进循环要求 `[0xF02ED565]==0`"与"武装要求它!=0 或 state 字节!=0"并成一条：
+# **只剩任务 state 字节这条路**。值本身用 `MT6252_DUMP=0xF02ED560:0x18,0xF029EEA0:0x40` 读。
+[[patch]]
+addr = 0x0837_04B8
+action = { kind = "count", label = "记录武装循环:入口" }
+
+[[patch]]
+addr = 0x0837_04D6
+action = { kind = "log_reg", reg = "r0", label = "记录武装:FCD0判据值(非0走终结)" }
+
+[[patch]]
+addr = 0x0837_04DE
+action = { kind = "count", label = "记录武装:走了终结路径" }
+
+[[patch]]
+addr = 0x0837_04F2
+action = { kind = "log_reg", reg = "r0", label = "记录武装:FD04判据值(非0跳过本轮)" }
+
+[[patch]]
+addr = 0x0837_BB00
+action = { kind = "count", label = "武装记录:入口" }
+
+[[patch]]
+addr = 0x0837_BB14
+action = { kind = "log_reg", reg = "r0", label = "武装记录:C26C0判据值" }
+
+[[patch]]
+addr = 0x0837_BB1C
+action = { kind = "count", label = "武装记录:真的写了1(总闸合上)" }
+
+[[patch]]
+addr = 0x0837_BB60
+action = { kind = "count", label = "武装记录:判据为0直接返回" }
+
+[[patch]]
+addr = 0x082C_26E4
+action = { kind = "count", label = "C26C0:落到任务state字节那条路" }
+
+[[patch]]
+addr = 0x082C_26DC
+action = { kind = "count", label = "C26C0:返回1" }
+
+# 记录注册器：`sub_08363864` 把 `0x00112711` 写进 rec+0、把硬编码的 **0x283A** 写进 rec+4，
+# 清 rec+0x10/+0x14/+0xc，然后**立刻** `bl 0x083704B8` 试一次武装。它自己没有 bl 调用者，
+# 地址 0x08363865 出现在 12 字节表 `0x086E1288` 的 **key=0x11** 槽（0x086E12E8/0x086E12EC）。
+[[patch]]
+addr = 0x0836_3864
+action = { kind = "count", label = "记录注册器:入口" }
+
+# 0x2903 的**唯一物化点**（子代理穷举：字面量池只有 0x083bfca4 这一处是代码用的，
+# `mov.w`/`movs+lsl+adds` 两种拼法全 ROM 专项扫描都 0 命中）。我逐字节核过池 `03 29 00 00`：
+#   0x083bfc8e 0549  ldr r1,[=0x2903]
+#   0x083bfc92 1980  strh r1,[r3]      ; block[0]=0x2903
+#   0x083bfc96 5980  strh r1,[r3,#2]   ; block[2]=0x0C（目的）
+#   0x083bfc98 1872  strb r0,[r3,#8]   ; block[8] = arg0 ← 正是 handler 里 cmp 的那个字节
+#   0x083bfc9e 8bf607fc bl 0x0824b4b0  ; 走"同步等待者回调链"，不经 QUEUE_Send
+[[patch]]
+addr = 0x083b_fc80
+action = { kind = "count", label = "发0x2903:唯一发送者入口" }
+
+# ── 16 个发送站点逐个钉计数（r2 逐条验过：7 处都是 `bl 0x081EB1E8`、9 处都是 `bl 0x0820B000`）──
+# 上一轮实测（`dump/run_bd3b.log`）已经把两个假设都排掉了：
+#   `PSrv发送:0xBD5发送者入口=2`、`0xBD3发送者入口=0`，但 `0x08077EB8` 那道二选一判别器
+#   （`PSrv判别:走0xBD3分支 / 走0xBD5分支 / r4加0A的字节`）**三条全 0** ⇒ 那 2 次 0xBD5 不是
+#   从 `0x08077EE8` 发的；全局门 (b) 实测也是开着的（`*(0xF02815E4)=0xF02815F0`，
+#   `+0x13*0x20+0x16` 处字节 = 1，`src_mod = 0x14`）。所以只剩"16 个站点里谁响"这一个问题。
+# 站点标签都带 `PSrv站点`，跑的时候 `MT6252_PROBES=PSrv站点` 一条就够（16 个冷钩子，几乎不要钱）。
+[[patch]]
+addr = 0x0805_33A2
+action = { kind = "count", label = "PSrv站点:BD5_080533A2" }
+
+[[patch]]
+addr = 0x0805_33CC
+action = { kind = "count", label = "PSrv站点:BD5_080533CC" }
+
+[[patch]]
+addr = 0x0807_7EE8
+action = { kind = "count", label = "PSrv站点:BD5_08077EE8" }
+
+[[patch]]
+addr = 0x080B_0512
+action = { kind = "count", label = "PSrv站点:BD5_080B0512" }
+
+[[patch]]
+addr = 0x080B_05B8
+action = { kind = "count", label = "PSrv站点:BD5_080B05B8" }
+
+[[patch]]
+addr = 0x080B_08FE
+action = { kind = "count", label = "PSrv站点:BD5_080B08FE" }
+
+[[patch]]
+addr = 0x080B_0A86
+action = { kind = "count", label = "PSrv站点:BD5_080B0A86" }
+
+# 实测确认：16 站里**只有这一站**响（`dump/run_sites.log`：`PSrv站点:BD5_080B0A86=2`，
+# 9 个 BD3 站与另 6 个 BD5 站全 0），首次发在片 ~3568–3700。它的判别器和 `0x08077EB8`
+# 同形：`0x080B0A58 a0 7a ldrb r0,[r4,#0xa] / 0x080B0A5A 00 28 cmp #0 / 0x080B0A5C 12 d1
+# bne 0x080B0A84` → 非 0 就发 BD5。所以 `[r4+0xA] != 0` 是当前缺口，
+# 而下一跳要知道 `r4` 是哪个记录（拿到地址就能用 `MT6252_WATCH` 抓谁写 `+0xA`）。
+# ⇒ 判别器跳过了 `A5E`（那是没走的 BD3 分支体），钩子必须打在**走到的** `0x080B0A84`
+# （`20 89 ldrh r0,[r4,8]`，r4 还有效）。函数头是 `push {r3,r4,r5,r6,r7,lr}`，
+# 所以这里的 `lr` 就是"谁调用了这个发送函数"。
+[[patch]]
+addr = 0x080B_0A84
+action = { kind = "log_pair", reg = "r4", reg2 = "lr", label = "PSrv站点:BD5_080B0A86的记录与调用者" }
+
+# 【2026-09-26 实测判决】`MT6252_PROBES=PSrv站点` 一轮跑完：16 站里**只有 `0x080B0A86` 响（2 次）**，
+# 9 个 BD3 站与另 6 个 BD5 站全 0；`dump/run_byte.log` 在 `0x080B0A84` 处读 `r0`（= 判别器刚读的
+# `[r4,#0xa]`，A58 之后没人动过 r0）⇒ **两次都是 `0x1`**，两条记录 `r4 = 0xF01760C8 / 0xF01761D8`
+# （相差 0x110）。写监视 `0xF01760D2` 抓到唯一写者是 `0x0807152E strh r5,[r0,#0xa]`，
+# 而那是 `bl 0x0823FB6C` 之后填**新分配块**的字段、`r5` 就是构造器的第 3 入参 ⇒
+# **`+0xA` 不是"没人排空的计数"，而是本次负载的字节长度**（代理给出三条硬证据：
+# 它同时是 `adds r0,#0x14` 的分配大小、`movs r2,r5`+`adds r0,#0xe`+`blx 0x08245F48` 的 memcpy 长度、
+# 并且被下一级原样复制）。构造器真入口是 **`0x08071504`**（`ff b5` = `push {r0-r7,lr}`；
+# 出口 `0x08071574` = `05 b0 f0 bd`，帧 `0x24+0x4` 与 `0x14+0x14` 配平）——
+# 我先前 `s 0x071508` 是从函数中段起的，前面 `25 73 22 00` 是 `+EGMR: "%s"` 字符串池。
+# 它**全 ROM 只有一个调用者** `0x08048BCE`，且第 3 入参是 `ldrh r2,[r5,#0xa]` 的**纯拷贝**
+# ⇒ 长度 0 不会在这条链内部产生，只能来自上游 **EGM TLV 记录流**
+# （迭代器 `0x0823FD9A` 只有 6 个半字：`ldrh r2,[r0]; strh r2,[r1]; ldrh r1,[r0,#4]; adds r0,#8;
+#   adds r0,r1,r0; bx lr` = `[u16 值][u16 长度][负载]` 链）。
+# 而 `0x080B097A` 的四路开关确认：**长度 ∈ {0,2,3,4} 才发 0xBD3**（各自 cmd=0xE/1/2/4），
+# 长度 1 落到 `0x080B09C8` **静默返回**；`0x080B0A58` 那处则是"0 → BD3 / 非 0 → BD5"。
+# 实测长度 = 1 ⇒ 我们喂到的 EGM 记录是个 1 字节负载的包。
+# 【为什么这条不再是主攻方向】C 参考版能出完整 UI，而它全部硬改就 10 处（`hook备份.c` 比
+# `main.c` 多的 27 个 case 我逐条查过**全是 printf 探针**），**没有一处在这条 0x11/0xBD3/EGM 链上**；
+# 他唯一在这一族里打桩的是兄弟闸 `0x08370220`（"开机流程全部完成"返 r0=1，画像已有）。
+# ⇒ 这条链**大概率不是待机屏的必要条件**，先按"能不能画出待机屏"直接测，不再往下钻。
+[[patch]]
+addr = 0x080B_0A84
+action = { kind = "log_reg", reg = "r0", label = "PSrv站点:判别器实际读到的字节" }
+
+[[patch]]
+addr = 0x0807_7BFA
+action = { kind = "count", label = "PSrv站点:BD3_08077BFA" }
+
+[[patch]]
+addr = 0x0807_7E88
+action = { kind = "count", label = "PSrv站点:BD3_08077E88" }
+
+[[patch]]
+addr = 0x0807_7EE0
+action = { kind = "count", label = "PSrv站点:BD3_08077EE0" }
+
+[[patch]]
+addr = 0x080B_0166
+action = { kind = "count", label = "PSrv站点:BD3_080B0166" }
+
+[[patch]]
+addr = 0x080B_0576
+action = { kind = "count", label = "PSrv站点:BD3_080B0576" }
+
+[[patch]]
+addr = 0x080B_086C
+action = { kind = "count", label = "PSrv站点:BD3_080B086C" }
+
+[[patch]]
+addr = 0x080B_09AC
+action = { kind = "count", label = "PSrv站点:BD3_080B09AC" }
+
+[[patch]]
+addr = 0x080B_0A30
+action = { kind = "count", label = "PSrv站点:BD3_080B0A30" }
+
+[[patch]]
+addr = 0x080B_0A7E
+action = { kind = "count", label = "PSrv站点:BD3_080B0A7E" }
+
+# ── 判别器：0xBD3 与 0xBD5 是**同一个函数里二选一**发出来的 ──
+# 【更正前一个代理"0xBD3 生产者不在 ROM 里"的说法】它有自己的发送者，我逐条核过：
+#   0x08077EB8  a0 7a  ldrb r0,[r4,#0xa]      ← 唯一分派判据：这个字节是否为 0
+#   0x08077EBA  00 28  cmp r0,#0
+#   0x08077EBC  13 d1  bne 0x08077EE6         ← 非 0 → 走 0xBD5
+#   0x08077EE0  93f18ef8  bl 0x0820B000       ← 为 0 → **发 0xBD3**
+#   0x08077EE6  2089     ldrh r0,[r4,8]
+#   0x08077EE8  73f17ef9 bl 0x081EB1E8        ← **发 0xBD5**
+# 两个发送者：`sub_0820B000` 池 `0x0820B028 = d3 0b 00 00`、`sub_081EB1E8` 池
+#   `0x081EB1FC = d5 0b 00 00`；两者都 src=`[*0xF02815E0]`(u16)、dest 硬编码 `0x46`，
+#   分别经封装器 `0x0810443E`(local_para 0x12 字节) / `0x080D6264`(6 字节)；
+#   唯一写 `ilm.msg_id` 的指令是 `0x0820991A c6 80 strh r6,[r0,#6]`，r6 是运行期实参。
+# 实测 `0xBD5 ×2 / 0xBD3 ×0`，所以**最可能**是 `rec+0x0A != 0` 把控制流全送到 BD5 那边；
+# 次可能是这批发送函数压根没被调到。下面 5 条一跑就能判死（钩子在指令**之前**触发，
+# 所以读 `ldrb` 的结果要打在它的下一条 `0x08077EBA`）。
+[[patch]]
+addr = 0x0807_7EBA
+action = { kind = "log_reg", reg = "r0", label = "PSrv判别:r4加0A的字节" }
+
+[[patch]]
+addr = 0x0807_7EE0
+action = { kind = "count", label = "PSrv判别:走0xBD3分支" }
+
+[[patch]]
+addr = 0x0807_7EE8
+action = { kind = "count", label = "PSrv判别:走0xBD5分支" }
+
+[[patch]]
+addr = 0x0820_B000
+action = { kind = "count", label = "PSrv发送:0xBD3发送者入口" }
+
+[[patch]]
+addr = 0x081E_B1E8
+action = { kind = "count", label = "PSrv发送:0xBD5发送者入口" }
+
+# ── PSrv/MDM 侧的"通道 state 状态机"：0xBD3 是唯一能把 state 推离 0 的入口 ──
+# 实测收敛到的墙（`dump/run_pix.log`，9000 片）：MMI 收到过 `0xBD5 ×2`（只清 state）、`0xDBB`
+# （把"支持"位 `[0xF029EEA4+0]` 写成 1），但 **`0xBD3` 一次都没收到** ⇒
+# `[0xF029EEA4+1]` / `[0xF029EEAC+1]` 到片 8000 仍是 0 ⇒ `sub_082C26C0` 返回 0 ⇒
+# `sub_0837BB00` 两次 `beq` 直接返回 ⇒ `[0xF030FC10]` 永不置 1 ⇒ `0x2903` 到了也被**丢弃**。
+# 下面每跳钉一个计数，这样"注入/修好 0xBD3 之后"能一眼看出走到第几跳就停：
+#   处理器 → 状态机 → 派发下标 → 写快捷位/写 state → 判据 → 武装 → 总闸接受
+# 地址全部按原始半字核过在指令边界上：`0x083982A8`/`0x083982C8` = `70 b5`(push)，
+# `0x083A6070` = `f8 b5`，`0x083A608A` = `3b 79`(ldrb r3,[r7,#4])，
+# `0x083A60E6`/`0x083A60F4`/`0x083A610E`/`0x083BFCE2` = `68 70`/`60 70`(strb ?,[?,#1])。
+# 派发下标要在 `ldrb` 的**下一条** `0x083A608C` 才读得到（钩子在指令之前触发）。
+[[patch]]
+addr = 0x0839_82A8
+action = { kind = "count", label = "PSrv状态机:0xBD3处理器" }
+
+[[patch]]
+addr = 0x0839_82C8
+action = { kind = "count", label = "PSrv状态机:0xBD5处理器" }
+
+[[patch]]
+addr = 0x0805_6350
+action = { kind = "count", label = "PSrv状态机:0xDBB处理器" }
+
+[[patch]]
+addr = 0x083A_6070
+action = { kind = "count", label = "PSrv状态机:入口" }
+
+[[patch]]
+addr = 0x083A_608C
+action = { kind = "log_reg", reg = "r3", label = "PSrv状态机:派发下标(P加4处)" }
+
+[[patch]]
+addr = 0x083A_60E6
+action = { kind = "count", label = "PSrv状态机:写快捷位F02ED565" }
+
+[[patch]]
+addr = 0x083A_60F4
+action = { kind = "count", label = "PSrv状态机:写state=2" }
+
+[[patch]]
+addr = 0x083A_610E
+action = { kind = "count", label = "PSrv状态机:写state=3" }
+
+[[patch]]
+addr = 0x083B_FCE2
+action = { kind = "count", label = "PSrv状态机:写state=4到A" }
+
+# ── 地标探针：直接用 C 参考版作者的"函数名字典"钉入口 ──
+# `MT6252_Simulator/docs/hook备份.c` 是作者早期逐地址命名的钩子备份（72 条，**全部 printf，
+# 不多一处桩** —— 我做过差集：它独有的 27 个 case 全是探针）。里面有几个正是我要的地名：
+#   0x0800A006 MMI_TASK          0x0800A0CE mmi handle msgid[r0]
+#   0x0823FE32 msg_send_ext_queue(ilm_struct*)   0x08245B68 mmi_frm_scrn_enter(parent_id=r0)
+#   0x08347CE0 mmi_bootup_flow_completed         0x083647B9 mmi_frm_proc_con_create_and_execute
+#   0x0822014A "将屏幕缓存刷新到硬件"(buff ptr=r0) 0x082D0554 process_cb_table
+# 顺带从 `src/typedef.h:2` 拿到 **权威 `ilm_struct` 布局**：
+#   `+0 src_mod_id(u16) +2 dest_mod_id(u16) +4 sap_id(u16) +6 msg_id(u16) +8 local_para_ptr +C peer_buff_ptr`
+#   ⇒ **更正我先前"`[msg+4]` 是发送 API 塞的常量 0x44"：那是 `sap_id`。**
+# 这一组一次跑完就能回答"开机到底走到哪一步停住"，比逐闸挖快得多。
+[[patch]]
+addr = 0x0800_A006
+action = { kind = "count", label = "地标:MMI_TASK" }
+
+[[patch]]
+addr = 0x0800_A0CE
+action = { kind = "log_reg", reg = "r0", label = "地标:MMI处理的消息id" }
+
+[[patch]]
+addr = 0x0823_FE32
+action = { kind = "count", label = "地标:msg_send_ext_queue" }
+
+[[patch]]
+addr = 0x0823_FE32
+action = { kind = "log_at", reg = "r0", offset = 6, size = 2, label = "地标:发出的msg_id" }
+
+[[patch]]
+addr = 0x0823_FE32
+action = { kind = "log_at", reg = "r0", offset = 2, size = 2, label = "地标:发往的dest_mod_id" }
+
+[[patch]]
+addr = 0x0824_5B68
+action = { kind = "log_reg", reg = "r0", label = "地标:mmi_frm_scrn_enter的parent_id" }
+
+[[patch]]
+addr = 0x0834_7CE0
+action = { kind = "count", label = "地标:mmi_bootup_flow_completed" }
+
+[[patch]]
+addr = 0x0836_47B9
+action = { kind = "count", label = "地标:mmi_frm_proc_con_create_and_execute" }
+
+# 作者命名的同步回调表派发（`0x082D0554 = process_cb_table`、`0x081E9580 = process cb table`）。
+# 0x2903 那条消息就是走这条路投递的（子代理核到 `0x0824B4B0 → 0x081E93FC → 0x082D0554`），
+# 所以"哪些事件真的送到了等待者"要在这里看，而不是只看发送侧计数。
+[[patch]]
+addr = 0x082D_0554
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "地标:process_cb_table参数" }
+
+# `sub_0837BD18`：子代理读通它是"扩展信号量不存在就创建 + **立刻 offer**"
+# （`bl 0x0837BD19` 里的 1 是 thumb 位，真身入口在偶地址；0x0837BD18 实测首半字 `70 b5` = push），
+# 而 `mmi_bootup_flow_completed` 里正是用它对 `0x283A` 打了一拍。
+[[patch]]
+addr = 0x0837_BD18
+action = { kind = "log_reg", reg = "r0", label = "地标:建并立即offer的id" }
+
+# ── LISR 注册清单对账（C 版留了底）──
+# `../MT6252_Simulator/logs/interrupt_handle列表.log`（C 参考版工程内）是 C 参考版实测打出来的
+# **25 条** `IRQ_Register_LISR` 记录，取参方式来自 `docs/hook备份.c:760`（该文件 27 条独有钩子
+# 全是 printf 探针、没有一条改状态 ⇒ C 版的硬改就是我已对账的那 10 处，画像不缺）：
+#   r0 = 中断号 num，r1 = 处理函数 entry，r2 = 名字字符串指针
+# 对照清单里两条已被我独立证实的：`num[1] CTIRQ1 = 0x400082F9` ✓、`num[4] USIM_Lisr = 0x080F5EB1` ✓。
+# 缺哪条就说明那条中断线在本模拟里根本没人接，是"投递成功但没反应"的一类根因。
+[[patch]]
+addr = 0x0819_F274
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "LISR注册:号与入口" }
+
+[[patch]]
+addr = 0x0819_F274
+action = { kind = "log_str", reg = "r2", label = "LISR注册:名字" }
+
+# INIT_SRAM 里的 IRQ 入口（运行时才搬进去的，ROM 里看不到）：
+#   0x4000A290 stmdb sp!,{r1} / 0x4000A294 mrs r1,spsr / 0x4000A298 tst r1,#0x80
+#   / 0x4000A29C ldm sp!,{r1} / 0x4000A2A0 subsne pc,lr,#4
+# 也就是"被打断时中断是关着的那就就地返回"。这两个计数把"进了入口"和"过了这道闸"分开数：
+# 实测 SIM 那次投递之后派发器一次都没读 INT_STATUS，所以要么被这道闸弹回，要么根本没到这里。
+[[patch]]
+addr = 0x4000_A298
+action = { kind = "count", label = "IRQ入口:测SPSR" }
+
+[[patch]]
+addr = 0x4000_A2A4
+action = { kind = "count", label = "IRQ入口:过了SPSR闸" }
+
+# C 参考叙事里 `SIM RESET OK` 之后的三格（`target/ref_boot.log` 逐条给过地址）。
+# 三处都反汇编核对过是 `bl 0x819f5b4`(`kal_debug_print`) 本身，不是 ±4 猜的。
+# 编号接着上面的 `C路线23` 往下排，免得又出现"同一里程碑两套名字"。
+[[patch]]
+addr = 0x081B_E562
+action = { kind = "count", label = "C路线24:IMEI" }
+
+[[patch]]
+addr = 0x0804_E97C
+action = { kind = "count", label = "C路线25:RL/GEA 终端能力" }
+
+[[patch]]
+addr = 0x0804_E992
+action = { kind = "count", label = "C路线26:MS GPRS 参数" }
+
+# ── 显示状态 getter 普查：谁在等哪个状态 ──
+# 状态字节 `[0xF01D2A5C]` 实测只在 2↔6 之间跳。写它的是 `sub_082F8F58`（17 个调用点，已单独查），
+# **读**它的是一族"等于某个值吗"的小 getter。给这八个入口各挂一个计数，就能一轮分清：
+# 哪些状态确实有人在等（调用数 > 0 但永远等不到），哪些状态压根没人问过（说明那条流程根本没启动，
+# 该往上游找，而不是继续盯状态机本身）。
+[[patch]]
+addr = 0x082F_8E8C
+action = { kind = "count", label = "状态getter:==2" }
+
+[[patch]]
+addr = 0x082C_FCF4
+action = { kind = "count", label = "状态getter:==3" }
+
+[[patch]]
+addr = 0x082C_FD1C
+action = { kind = "count", label = "状态getter:==4" }
+
+[[patch]]
+addr = 0x082C_FD08
+action = { kind = "count", label = "状态getter:==5" }
+
+[[patch]]
+addr = 0x082D_4068
+action = { kind = "count", label = "状态getter:==6" }
+
+[[patch]]
+addr = 0x082D_4054
+action = { kind = "count", label = "状态getter:==7" }
+
+[[patch]]
+addr = 0x082D_1B70
+action = { kind = "count", label = "状态getter:==0x18" }
+
+[[patch]]
+addr = 0x081E_1F3C
+action = { kind = "count", label = "状态getter:属于{17,18}(GDI闸)" }
+
+# ── `sub_08183B94` = `lcd_fb_update_to_memory`（名字串在 `0x08183BC0`）──
+# 全 ROM 只有两个调用者（`find_bl` + 字面量/指针表扫描都做了，表里 0 命中）：
+#   `0x080F698A` 在 L1D WIN 那一带（同一个函数里 `ldr r0,[0xF021FDF0]; subs r0,#0x48` 自己拼
+#     一个 0x48 字节 L1 描述符，再连着 `bl 0x821F8C0/0x8220120/0x822FF4C/0x821FFC8/0x8220010`）；
+#     它前面是 `0x080F6984 cmp r4,#0 / bne 0x080F6998` ⇒ **r4≠0 就整个跳过刷屏**。
+#   `0x081FFB4A` 在 GDI 贴图模块（`0x081FFEDC` 那一族，实测从没跑过）。
+# C 版作者留下的最接近"刷屏"的东西正好对上：`docs/hook备份.c:392` 在 `0x0822014A` 上注释
+# "将屏幕缓存刷新到硬件"。所以先问：**这段刷屏代码在我这边跑没跑、走的是哪条边**。
+[[patch]]
+addr = 0x080F_690A
+action = { kind = "count", label = "L1D刷屏函数体内" }
+
+[[patch]]
+addr = 0x080F_698A
+action = { kind = "count", label = "lcd_fb_update 调用点1(L1D)" }
+
+[[patch]]
+addr = 0x080F_6998
+action = { kind = "count", label = "调用点1被跳过(r4≠0)" }
+
+[[patch]]
+addr = 0x081F_FB4A
+action = { kind = "count", label = "lcd_fb_update 调用点2(GDI)" }
+
+# ---------- 键盘链（2026-09-26 起，配合 MT6252_KEYS 脚本注入）----------
+# 实测固件自己报出来的注册：`LISR注册:号与入口(0x8)(0x8003405)` + `名字: KBD handler`
+# （见 dump/run_hostpng.log:303），所以**逻辑 8 号线的 LISR 就是 0x0800_3404**（Thumb 位减 1）。
+# 它不直接读 KP 寄存器，而是：`blx 0x082348AC` → 把 [0xF016BDF8] 的 bit16 置 1 →
+# [0xF016BE80+4] 计数 +1 → `blx 0x082348B4` → `bl 0x081A1398([0xF016BDF4])`。
+# ⇒ 中断侧只要"进得来 + 标志置得上"，真正的扫描在别处。
+[[patch]]
+addr = 0x0800_3404
+action = { kind = "count", label = "键盘KBD_LISR进入" }
+
+# 读一层 KP_MEM 的公共小助手：`r1∈{0,1,2,3}` → 读 [0x81070000+4/8/c/10]，
+# `r1==4` 走 `assert(0xC0C)` ⇒ **固件的这层助手只支持 4 组 64 个矩阵位**，
+# 所以画像里 72 项矩阵的后 8 项（索引 64..71）固件根本读不到，别按"丢了"当 bug 查。
+# 三条探针分别钉：进助手、读 KP_STA、以及"命中/未命中"两条出口。
+[[patch]]
+addr = 0x0800_3768
+action = { kind = "count", label = "键盘读层助手进入" }
+
+[[patch]]
+addr = 0x0800_3790
+action = { kind = "count", label = "键盘读KP_STA" }
+
+# 0x3796 `bics r5,r4` 之后 `beq` 落空的那条（0x379A `movs r0,#1`）才是"这层里确实有键被按下"
+[[patch]]
+addr = 0x0800_379A
+action = { kind = "count", label = "键盘该层有按下" }
+
+# ---------- 键盘驱动的注册现场（2026-09-26 用 r2ghidra + capstone 解出来）----------
+# `0x0800_20B8` 是键盘驱动初始化，四件事按顺序做：
+#   1) `[0xF01D2838+4]` 为空就 `bl 0x0819FB6C("KBDEVT")` 建一个 OS 队列/信号量，句柄存回 +4；
+#   2) `[0xF01D2838]` 为空就写魔数 `0x1234`，再 `bl 0x0819F9DC(r0=0x10, r1=0x0800_33F1)`
+#      —— **物理号 16 的高优先处理**，逻辑 8 经 `line_map` 换出来正好是 16，
+#      与 LISR 壳里 `[0xF016BDF8] |= 1<<16` 对得上；
+#   3) `bl 0x0819F274(8, 0x0800_3405, "KBD handler")` = `IRQ_Register_LISR`（就是那个记账壳）；
+#   4) 写 `KP_DEBOUNCE(+0x18)=0x200`、`[r5+C]=200`、`[r5+10]=100`，再 `bl 0x0819F328(r0=8,r1=1)` 使能。
+# `0x0800_33F0` 的函数体只有一句：`0x0823F7B6(*[0xF01D2838]+4, 1, 0)`，
+# 即**往 KBDEVT 句柄投递 1** —— 键盘真正的解码在等这个句柄的那个任务里，不在中断里。
+# C 作者自己在 `docs/hook备份.c:153` 把这个地址注释成"按键高优先级中断"。
+[[patch]]
+addr = 0x0800_33F0
+action = { kind = "count", label = "键盘高优先处理" }
+
+# 高优先注册现场：r0 = 号（期望 0x10），r1 = 处理函数（期望 0x080033F1）
+[[patch]]
+addr = 0x0819_F9DC
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "键盘高优先注册" }
+
+# KBDEVT 投递：r0 = 句柄。要能和 `0x0819FB6C("KBDEVT")` 返回的句柄对上才算数
+[[patch]]
+addr = 0x0823_F7B6
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "队列投递r0与r1" }
+
+# `0x0801_F928(u32 out[2])` —— 真正的键盘矩阵快照，一次读全 64 位行线：
+# ```c
+# out[0] = (KP_MEM2 << 16) | KP_MEM1;   # 读 +4 / +8
+# out[1] = (KP_MEM4 << 16) | KP_MEM3;   # 读 +C / +10
+# ```
+# 与另外两个读 `0x8107_0000` 的点区分开：`0x0800_2100` 是驱动 init（只写 KP_DEBOUNCE），
+# `0x0800_372C` 是"我等的那颗键现在按着没"的谓词（只读 STA + 一层）。
+# 挂 `r0/lr` 是为了一次问出两件事：**有没有被调**，以及**调用者是谁**（LR 减 4 即调用点）。
+[[patch]]
+addr = 0x0801_F928
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "键盘矩阵快照" }
+
+# ---------- 键盘变化检测器（`0x0801_1D5E`，r2ghidra 解出来）----------
+# 结构：`bl 0x0801F928` 抓一次全 64 位矩阵快照 → 与"上一份"逐字比较 →
+# **完全相同就直接 return** → 否则对每个变化的位调 `0x0801_F870(&按下标志, &键信息, 上一份)`，
+# 位号越过 0x3E 时改调 `0x0801_82B0(&键信息, 上一份, 这一份)` 收尾。
+# 实测：注入按下/松开各触发一次快照（`lr=0x08011D75`），所以这一层是活的。
+# 下面三条用来问"那它到底解没解出一颗键、解出来之后给了谁"。
+[[patch]]
+addr = 0x0801_1D5E
+action = { kind = "count", label = "键盘变化检测进入" }
+
+[[patch]]
+addr = 0x0801_F870
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "键盘逐位解码" }
+
+[[patch]]
+addr = 0x0801_82B0
+action = { kind = "log_pair", reg = "r0", reg2 = "r1", label = "键盘解码收尾" }
+
+# ---------- 键盘事件泵 `0x0832C374` 的逐道闸门（2026-09-26 子代理静态定位 + 我逐条 r2 复核）----------
+# 出队函数 `0x083F87C4` 是通过**函数指针** `[0xF02338A8]` 被调的，所以"没有 BL 调用者"不等于没人调。
+# 实测环形队列 head/tail 从 0/0 变 2/2，说明这个泵确实跑过、也确实把两条都出队了。
+# 下面每条计数对应一个分岔，跑完就能说出它停在哪一道，不用再猜。
+#   0x0832C37A bl 0x0833636C ; cmp r0,#1 ; beq 0x0832C3E6   ← 计数器闸（[0xF02338E7] != 0 就一条不发）
+#   0x0832C386 ldr r1,[r7] ; cmp r1,#0 ; beq 0x0832C3EC     ← 指针没注册
+#   0x0832C38C blx r1 ; cmp r0,#1 ; bne 0x0832C3EC          ← 出队返回不是 1（环空）
+#   0x0832C3A4 cmp r4,#0 / cmp r4,#1 ; bne 0x0832C3E6        ← 事件类型必须 0 或 1（3 会被丢）
+#   0x0832C3AC ldrb r0,[r7,#4] ; cmp #2 / cmp #1            ← 模式 [0xF02338AC]，只有 2 或"1 且回调恰好是 0x083F87C5"才发
+#   0x0832C3BE 起：拼 ilm（src=0x46 MMI, dest=0x14 L4, msg_id=0x0B4C），0x0832C3E2 bl 0x08261BF4 发送
+[[patch]]
+addr = 0x0832_C374
+action = { kind = "count", label = "键盘泵进入" }
+
+[[patch]]
+addr = 0x0832_C380
+action = { kind = "count", label = "键盘泵被计数器挡住" }
+
+[[patch]]
+addr = 0x0832_C38C
+action = { kind = "count", label = "键盘泵调出队回调" }
+
+[[patch]]
+addr = 0x0832_C392
+action = { kind = "count", label = "键盘泵出队返回1" }
+
+[[patch]]
+addr = 0x0832_C3AC
+action = { kind = "count", label = "键盘泵类型0或1通过" }
+
+[[patch]]
+addr = 0x0832_C3BE
+action = { kind = "count", label = "键盘泵全闸通过拼ilm" }
+
+[[patch]]
+addr = 0x0832_C3E2
+action = { kind = "count", label = "键盘泵发出ilm" }
+
+[[patch]]
+addr = 0x0832_C3E6
+action = { kind = "count", label = "键盘泵bail返回1不发" }
+
+[[patch]]
+addr = 0x0832_C3EC
+action = { kind = "count", label = "键盘泵返回0" }
+
+# 调用方那道位图闸：`0x08349602 ldrb r0,[r0,#5] ; lsls #0x1b ; bmi 0x0834968C`
+# 即 [0xF02338AD] 的 bit7 置起来就整轮跳过泵
+[[patch]]
+addr = 0x0834_960C
+action = { kind = "count", label = "键盘泵被调用方执行" }
+
+# ---------- 键进 UI 之后在哪一级消失（2026-09-26 第九续）----------
+# 第八续把"模式字节为 0"当成根因，是错的：泵在判模式之前就把出参写回调用方
+# （0x0832C398/9C/9E 早于 0x0832C3AC），且 bail 分支 0x0832C3E6 是 `movs r0,#1` 返回 1，
+# 所以 0x08349612 的 `cmp r0,#1` 照样通过，接着 0x0834961C 调 0x0837FB38 把键送进 UI 链。
+# 下面每条计数对应链上的一级，判据是"计数在哪一级断掉"。
+# 落点是 0x082D0554 按 msg_id 在 RAM 表 0xF0168320（步长 12：u16 msg_id / u32 函数指针数组 /
+# u32 对象链表）里找槽，再由 0x081EAA94 调数组、数组返回 0 才走对象链表。
+# 两处"空表就什么都不做"：0x082D0568（数组指针为空 → return -513）、0x081EAAB4（链表为空 → return）。
+[[patch]]
+addr = 0x0834_961C
+action = { kind = "count", label = "键UI:进三元组转换" }
+
+[[patch]]
+addr = 0x0837_FB38
+action = { kind = "count", label = "键UI:FB38" }
+
+[[patch]]
+addr = 0x0837_AC10
+action = { kind = "count", label = "键UI:AC10类别翻译" }
+
+[[patch]]
+addr = 0x0837_D36C
+action = { kind = "count", label = "键UI:D36C派发" }
+
+[[patch]]
+addr = 0x0824_B4B0
+action = { kind = "count", label = "键UI:B4B0post" }
+
+[[patch]]
+addr = 0x082D_0554
+action = { kind = "count", label = "键UI:0554查表" }
+
+[[patch]]
+addr = 0x081E_AA94
+action = { kind = "count", label = "键UI:AA94对象链" }
+
+# ---------- 分派出口计数（第九续补，严格挂在分支目标上）----------
+# `0x081EAA94(r0=槽号, r1=消息)` 的实际结构（我 r2 正向核过）：
+#   0x081EAA9A muls r0,r3(=12),r0 ; r6 = 0xF0168320 + 12*槽号   ← **索引是槽号，不是 msg_id**
+#   0x081EAAA4 ldr r1,[r6,#4] ; ldr r1,[r1,#4*k] ; cmp r1,#0 ; bne 0x081EAAC0   → 数组里有 handler
+#   0x081EAAB4 ldr r1,[r6,#8] ; cmp r1,#0 ; beq 0x081EAAE6                      → 链表为空，什么都不做
+#   0x081EAAC2 blx r1 ; cmp r0,#0 ; bne 0x081EAAE6                              → handler 返回非 0 = 已消费
+# 上一轮 `B4B0post=93 / 0554查表=103 / AA94对象链=93` 都远大于按键的 2 次，说明这三个是
+# 通用入口，**计数归不到按键头上**；要判定只能挂在"这条键专属的调用点"和"分派的出口分支"上。
+[[patch]]
+addr = 0x0837_D444
+action = { kind = "count", label = "键UI:D36C真的post" }
+
+[[patch]]
+addr = 0x081E_AAC0
+action = { kind = "count", label = "键UI:数组里有handler" }
+
+[[patch]]
+addr = 0x081E_AAC2
+action = { kind = "log_pair", reg = "r1", reg2 = "r5", label = "键UI:正在调handler" }
+
+[[patch]]
+addr = 0x081E_AAB4
+action = { kind = "count", label = "键UI:转对象链表" }
+
+[[patch]]
+addr = 0x081E_AABA
+action = { kind = "count", label = "键UI:链表非空" }
+
+# ---- SD card mount-state gate probes (2026-09-27, task #37) -------------------
+# The file manager answers "please insert storage card" because the FAT device
+# table entry for the SD volume never reaches mount state >= 2:
+#   table base 0xF015E2B4, stride 0x54, dev[1] = 0xF015E308, state byte = +0x1F
+#   measured in dump/f0150000_a0000_s3600.bin: dev[0].+1F = 5, dev[1].+1F = 0
+#   (dev[1].+10 = 0xF01D2894 = C's MSDC_Handle_Adr, defined.h:388)
+# The only writer of that byte is 0x082D4824, and it first asks an async job
+# (blx 0x08248A10) for status: -1 -> bail at 0x082D48D6, !=1 -> 0x082D48C4,
+# only ==1 reaches the strb at 0x082D486C (=1) / 0x082D491A (=2).
+# The C author watched this same byte: main.c:1608 pops "sd filesystem mount
+# fail" when 0 is written to 0xF015E327 -- so the reference build does not get
+# the SD volume mounted either. These probes decide "never called" vs
+# "called but the job never returns". Labels are ASCII on purpose: they are
+# filtered by MT6252_PROBES=SDstate.
+[[patch]]
+addr = 0x082D_4824
+action = { kind = "count", label = "SDstate_enter" }
+
+[[patch]]
+addr = 0x082D_4850
+action = { kind = "count", label = "SDstate_job_returned_1" }
+
+[[patch]]
+addr = 0x082D_48C4
+action = { kind = "count", label = "SDstate_job_other" }
+
+[[patch]]
+addr = 0x082D_48D6
+action = { kind = "count", label = "SDstate_job_minus1_bail" }
+
+[[patch]]
+addr = 0x082D_486C
+action = { kind = "count", label = "SDstate_write_1F_eq_1" }
+
+[[patch]]
+addr = 0x082D_491A
+action = { kind = "count", label = "SDstate_write_1F_eq_2" }
+
+# who asks, and for which volume: r1 = table index, r2 = required state
+[[patch]]
+addr = 0x083D_0210
+action = { kind = "log_pair", reg = "r1", reg2 = "r2", label = "SDstate_ask" }
+
+# the -29 (FS_DRIVE_NOT_READY) site: reached whenever a volume is below state 2
+[[patch]]
+addr = 0x083C_4B5E
+action = { kind = "count", label = "SDstate_check" }
+
+# ---- who unmounts the SD volume, and with which error (2026-09-27) -----------
+# MT6252_WATCH on 0xF015E327 showed the state does NOT stay 0 as first assumed:
+#   1 @slice407 (PC 0x082d486c) -> 2 @631 (0x082d491a) -> 3 @656 (0x0813da5e)
+#   -> 5 @656 (0x0813da82) -> **0 @682 (PC 0x081b3fcc)**
+# So the volume mounts to HasFS(5) and is then torn down. 0x081b3fcc is the
+# "job returned neither 1(done) nor -1(pending)" arm of the FAT job poll loop:
+#   0x081b3fa0 blx 0x8248a10 ; adds r0,#1 ; beq 0x81b3fd0 ; cmp r0,#1 ; bne 0x81b3fc2
+#   0x081b3fc2 ldr r0,[sp,#0x34] ; str r0,[sp,#0x80] ; bl 0x82443e8 ; strb r5,[r4,#0x1f]
+# r0 at 0x081b3fc2 is (job_status + 1) because of the `adds` above, so the real
+# code is r0-1. 500 slices is plenty: the event lands at slice 682.
+[[patch]]
+addr = 0x081B_3F88
+action = { kind = "log_reg", reg = "r0", label = "SDjob_outer_status_plus1" }
+
+[[patch]]
+addr = 0x081B_3FC2
+action = { kind = "log_reg", reg = "r0", label = "SDjob_status_plus1" }
+
+[[patch]]
+addr = 0x081B_3FCC
+action = { kind = "count", label = "SDjob_zeroes_mount_state" }
+
+[[patch]]
+addr = 0x081B_3FD0
+action = { kind = "count", label = "SDjob_minus1_arm" }
+
+[[patch]]
+addr = 0x081B_3F94
+action = { kind = "count", label = "SDjob_poll_loop" }
+
+# ---- which site actually produces the -34 that unmounts the SD volume? --------
+# -34 = FS_INVALID_SECTOR_SIZE (defined.h:323). Produced by `movs rX,#0x21 ; mvns rX,rX`
+# (note: ~0x21 = -34; ~0xDD would be -222 -- the first scan used the wrong
+# immediate and returned a false zero). 13 sites in the first 8 MiB.
+#
+# MEASURED 2026-09-27 (dump/sd34.log, 1200 slices, SDjob_zeroes_mount_state=1):
+# **all 13 SDerr34_* counters are 0** -- none of them runs. And the only pool
+# slot holding 0xFFFFFFDE (0x0869BC8C) has **no LDR-literal reference at all**
+# (exhaustive T1/T2 scan). => the -34 that unmounts the volume is *propagated*
+# from a callee or an error table, not computed here. Next step is to trace the
+# FAT job itself (posted at 0x081B3F5C via bl 0x824b4c8 with the descriptor at
+# sp+0x40, built by 0x083576C4 at 0x081B3F06), not to hunt constants.
+[[patch]]
+addr = 0x080C_E106
+action = { kind = "count", label = "SDerr34_80ce106" }
+
+[[patch]]
+addr = 0x0810_078C
+action = { kind = "count", label = "SDerr34_810078c" }
+
+[[patch]]
+addr = 0x0811_E530
+action = { kind = "count", label = "SDerr34_811e530" }
+
+[[patch]]
+addr = 0x081B_44B8
+action = { kind = "count", label = "SDerr34_81b44b8" }
+
+[[patch]]
+addr = 0x081F_5876
+action = { kind = "count", label = "SDerr34_81f5876" }
+
+[[patch]]
+addr = 0x0821_FBCC
+action = { kind = "count", label = "SDerr34_821fbcc" }
+
+[[patch]]
+addr = 0x0821_FBEC
+action = { kind = "count", label = "SDerr34_821fbec" }
+
+[[patch]]
+addr = 0x0829_6BBC
+action = { kind = "count", label = "SDerr34_8296bbc" }
+
+[[patch]]
+addr = 0x082F_E63C
+action = { kind = "count", label = "SDerr34_82fe63c" }
+
+[[patch]]
+addr = 0x0843_B69E
+action = { kind = "count", label = "SDerr34_843b69e" }
+
+[[patch]]
+addr = 0x0848_A1F8
+action = { kind = "count", label = "SDerr34_848a1f8" }
+
+[[patch]]
+addr = 0x0867_8E9E
+action = { kind = "count", label = "SDerr34_8678e9e" }
+
+[[patch]]
+addr = 0x0867_8EC4
+action = { kind = "count", label = "SDerr34_8678ec4" }
+
+# 作业句柄就是栈帧本身：`0x081B3FA0 mov r0,sp ; blx 0x8248a10`，结果字段是 `[sp,#0x34]`
+# （`0x081B3FC2 ldr r0,[sp,#0x34]` 读到的就是 -34）。跑起来是确定性的，所以先量一次 sp，
+# 再用 MT6252_WATCH=<sp+0x34>:4 抓"谁写的 -34"。
+[[patch]]
+addr = 0x081B_3F5C
+action = { kind = "log_reg", reg = "sp", label = "SDjob_handle_sp" }
+
+[[patch]]
+addr = 0x081B_3F5C
+action = { kind = "log_pair", reg = "r0", reg2 = "r4", label = "SDjob_handle_and_dev" }
+
+# `0x082EEBF8(r0=状态)` 是通用的"把完成状态写进作业项 [r4,#0x34] 并唤醒"例程
+# （实测 `str r5,[r4,#0x34]` @0x082EEC3E 就是写 -34 的那条，r5 是入参 r0）。
+# 所以 -34 是**调用者传进来的**：在入口打 r0 和 lr，一次就抓到是谁。
+[[patch]]
+addr = 0x082E_EBF8
+action = { kind = "log_pair", reg = "r0", reg2 = "lr", label = "SDerr_post" }
+
+# ---- 更正：-34 的真正产生点（2026-09-27 第二个子代理，我核过） ----------------
+# 上面 13 颗 SDerr34_* 全部钉错，原因是我的 `movs T1` 编码掩码把立即数位置写成
+# `(h>>8)&0xFF`（正确是 `(h>>3)&0xFF`），于是扫出来的一批站点根本不是 -34 的产生点，
+# 而"13 颗全 0 命中 ⇒ -34 是传递来的"这条结论跟着作废。正确的 4 颗在下面。
+# 顺带另一条我的错误：`ldr r1,[pc,#0x374]` 的 capstone 输出**已经按 4 缩放过**，
+# 我又乘了一次 4 才得到 0x082CBC40（值 0x18373556，落在代码里），真实池槽是
+# 0x082CBCE0 = **0x0000AA55** —— 那是引导扇区/MBR 的签名常量，不是"扇区大小"。
+# ⇒ 驱动确实是 MBR 感知的（`0x0813DA40` 比 0xAA55、走 4 个表项、`job+0x4c = 0x800`
+#   实测等于分区起始 LBA），**镜像布局是对的，不要改成 super-floppy**。
+[[patch]]
+addr = 0x0815_BAC0
+action = { kind = "count", label = "SDerr34b_815bac0" }
+
+[[patch]]
+addr = 0x082C_B99E
+action = { kind = "count", label = "SDerr34b_82cb99e" }
+
+[[patch]]
+addr = 0x082D_4892
+action = { kind = "count", label = "SDerr34b_82d4892" }
+
+[[patch]]
+addr = 0x082D_48A4
+action = { kind = "count", label = "SDerr34b_82d48a4" }
