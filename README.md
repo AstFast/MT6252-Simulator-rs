@@ -2,6 +2,8 @@
 
 AI+Rust重写
 
+fork https://github.com/1144822034/MT6252_Simulator
+
 ## 目录结构
 
 ```
